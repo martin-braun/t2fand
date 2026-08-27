@@ -1,9 +1,9 @@
-t2fand: 
-	echo "Nothing to compile!"
+.PHONY: install
 
-install: t2fand 
-	cp t2fand /usr/bin
-	cp t2fand.service /usr/lib/systemd/system
-	chmod 644 /usr/lib/systemd/system/t2fand.service
-	chmod 700 /usr/bin/t2fand
+DESTDIR ?=
+BINDIR ?= /usr/bin
+OPENRC_INITDDIR ?= /etc/init.d
 
+install:
+	install -D -m 0700 "t2fand" "$(DESTDIR)$(BINDIR)/t2fand"
+	install -D -m 0755 "t2fand.initd" "$(DESTDIR)$(OPENRC_INITDDIR)/t2fand"

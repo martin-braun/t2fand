@@ -1,0 +1,9 @@
+#!/sbin/openrc-run
+
+description="A simple daemon to control fan speed on Macs with T2 chip"
+command=/usr/bin/t2fand
+supervisor="supervise-daemon"
+respawn_delay="2"
+respawn_max="0"
+supervise_daemon_args="--respawn-delay-step 0"
+retry="SIGTERM/5"

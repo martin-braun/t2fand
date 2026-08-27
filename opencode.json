@@ -1,0 +1,74 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "lithon-planner",
+  "instructions": ["AGENTS.md"],
+  "subagent_depth": 2,
+  "share": "disabled",
+  "permission": {
+    "*": "deny",
+    "external_directory": "deny",
+    "read": "allow"
+  },
+  "agent": {
+    "build": { "disable": true },
+    "explore": { "disable": true },
+    "general": { "disable": true },
+    "lithon-assistant": {
+      "permission": {
+        "read": {
+          "<YOUR_ADDITIONAL_SECRETS>": "deny"
+        }
+      }
+    },
+    "lithon-builder": {
+      "permission": {
+        "read": {
+          "<YOUR_ADDITIONAL_SECRETS>": "deny"
+        },
+        "edit": {
+          "*": "allow"
+        },
+        "task": { "lithon-specificator": "allow" }
+      }
+    },
+    "lithon-coder": {
+      "permission": {
+        "read": {
+          "<YOUR_ADDITIONAL_SECRETS>": "deny"
+        }
+      }
+    },
+    "lithon-documentor": {
+      "permission": {
+        "read": {
+          "<YOUR_ADDITIONAL_SECRETS>": "deny"
+        },
+        "edit": {
+          "<YOUR_ADDITIONAL_DOCS>": "allow"
+        }
+      }
+    },
+    "lithon-planner": {
+      "permission": {
+        "read": {
+          "<YOUR_ADDITIONAL_SECRETS>": "deny"
+        }
+      }
+    },
+    "lithon-reviewer": {
+      "permission": {
+        "read": {
+          "<YOUR_ADDITIONAL_SECRETS>": "deny"
+        }
+      }
+    },
+    "lithon-specificator": {
+      "permission": {
+        "read": {
+          "<YOUR_ADDITIONAL_SECRETS>": "deny"
+        }
+      }
+    },
+    "plan": { "disable": true }
+  }
+}
