@@ -3,230 +3,239 @@
 ## Contract status and document roles
 
 This document is the contract truth for the local t2fand fork. `documented`
-means supported by checked-in source or configuration; it does not mean
-runtime-tested. `unknown` means local evidence is insufficient. This revision
-records the delivered OpenRC-only static implementation. The systemd unit is
-absent and the checkout contains only the OpenRC service definition; package,
-staged-install, and runtime behavior are not claimed.
+means supported by checked-in source, configuration, or test definitions; it
+does not mean runtime-tested or shipped. The global thermal fail-safe and
+complete OpenRC revision now have checked-in daemon, service, package, and
+fake-sysfs test definitions. Their runtime, hardware, service, package, and
+syslog outcomes remain separate and unknown. Existing source facts remain static
+evidence. Hardware, OpenRC lifecycle, package, staged-install, and test
+execution are reported separately as `unknown` until verified.
 
 `SPEC.md` owns contract truth. The recorder synchronizes `CONTEXT.md` after
-implementation. `README.md` is project documentation. `AGENTS.md` owns
-onboarding, ownership, routing, safety, and protected-surface rules.
+implementation. `README.md` is concise human onboarding; exhaustive contract
+and implementation detail stays in `SPEC.md` and `CONTEXT.md`. `AGENTS.md`
+owns onboarding, ownership, routing, safety, and protected-surface rules.
 
-## Problem
+## Problem and goals
 
 `t2fand` is a Python daemon for automatic fan-speed control on Macs with an
-Apple T2 chip running Linux. Its service integration must have one supported
-service manager, one defined service artifact, and one deterministic install
-path. The supported manager is OpenRC. Thermal safety, hardware coverage, and
-runtime lifecycle success are `unknown`.
+Apple T2 chip running Linux. It must consider every exposed Linux hwmon
+temperature, fail high when thermal input or configuration is unsafe, preserve
+ordinary smoothed control, and remain one supported OpenRC service.
 
-## Goals
+Goals:
 
-- Preserve the daemon's existing behavior and interfaces.
-- Make the checked-in `t2fand.initd` the sole service-manager definition and
-  OpenRC the sole supported service manager.
-- Install and package exactly the daemon and OpenRC artifact, with stable staged
-  paths and modes.
-- Run the already-foreground daemon under `supervise-daemon` with unlimited
-  all-exit respawn, a constant two-second delay, and explicit-stop suppression.
-- Retire dual-init selection and systemd-authoritative requirements without
-  erasing their historical contract evidence.
+- retain Python, the extensionless `t2fand` executable, and its installed path;
+- keep one-second sampling, at most five valid normal samples, fractional
+  Celsius, and the existing linear, cubic exponential, and logarithmic curves;
+- rediscover and reopen sysfs paths every cycle; never retain open sysfs
+  handles;
+- make CPU input mandatory while treating GPU input as optional with explicit
+  missing/recovery transitions;
+- make configuration, sensor, and fan-control failure behavior explicit;
+- provide flushed direct output and compact `--verbose` telemetry;
+- keep OpenRC as the only supported service manager and retain the two-file
+  runtime payload;
+- add bounded, backed-off OpenRC crash recovery and util-linux logger routing;
+- maintain fake-fixture tests and updated operator documentation for the
+  revision.
 
-## Users and roles
+## Users, scope, and non-goals
 
-| Role                        | Need                                                 | Status                                            |
-| --------------------------- | ---------------------------------------------------- | ------------------------------------------------- |
-| Linux user of a T2 Mac      | Automatic temperature-driven fan control             | documented daemon scope; hardware outcome unknown |
-| Root/system administrator   | Install, configure, and operate the OpenRC service   | current workflow; execution unknown               |
-| Arch Linux package consumer | Install the executable and OpenRC service definition | current static payload; package build unknown     |
-| Package maintainer          | Build and release the Arch package                   | documented workflow; execution unknown            |
+| Role                      | Need                                          | Status                                        |
+| ------------------------- | --------------------------------------------- | --------------------------------------------- |
+| Linux user of a T2 Mac    | Automatic safe temperature-driven fan control | checked-in contract; hardware outcome unknown |
+| Root/system administrator | Configure and operate the OpenRC service      | checked-in workflow; execution unknown        |
+| Arch package consumer     | Install the daemon and OpenRC definition      | checked-in package definition; build unknown  |
+| Maintainer                | Test, package, and document the revision      | checked-in definitions; execution unknown     |
 
-Supported hardware beyond the script's T2-oriented sysfs paths, distribution
-coverage beyond the declared Arch package, and non-root operation are `unknown`.
+In scope: the Python daemon, global hwmon discovery, configuration and fail-safe
+behavior, direct output, verbose telemetry, best-effort cleanup, `t2fand.initd`,
+unconditional OpenRC installation, Arch metadata, a standard library `unittest`
+suite, a project-native test target, and affected README, comments, and package
+descriptions.
 
-## Scope
-
-### In scope
-
-- Existing Python 3 executable `t2fand` and its current daemon behavior.
-- Existing root `t2fand.initd`, retained unchanged as the sole service
-  definition.
-- OpenRC-only administrator, Makefile, staged-install, and Arch package
-  workflows.
-- The delivered source omits `t2fand.service`, systemd Makefile paths/selection,
-  and systemd package payload.
-- Static inspection of service source, payload, paths, modes, and install rules.
-- Existing GitHub Actions package workflow, except that its package output is
-  expected to contain the OpenRC-only payload.
-
-### Out of scope
-
-- Changes to daemon algorithm, configuration schema, signal cleanup, or hardware
-  behavior.
-- Service or hardware execution, host writes, service enablement, and CI
-  execution for this contract update.
-- README/CONTEXT synchronization; the recorder handles `CONTEXT.md` after this
-  contract truth.
-- CI/source pinning, action upgrades, package rename, remote maintenance, GUI,
-  network API, or unrelated files.
-- Guessing an Arch OpenRC runtime dependency.
+Out of scope: alternate init systems, service selectors, systemd artifacts,
+package rename, payload expansion, GUI, network API/dependency, adaptive
+scheduling, persistent sysfs handles, Rust implementation, remote maintenance,
+secrets, unrelated files.
 
 ## Terminology
 
-| Term              | Definition                                                          | Status                                   |
-| ----------------- | ------------------------------------------------------------------- | ---------------------------------------- |
-| T2 Mac            | Hardware targeted by the project description and fan sysfs path     | documented; exact model set unknown      |
-| OpenRC artifact   | Root `t2fand.initd`, installed as `/etc/init.d/t2fand`              | current sole source artifact             |
-| daemon PID        | PID written by `t2fand` to `/run/t2fand.pid`                        | documented implementation                |
-| foreground daemon | `/usr/bin/t2fand` process not backgrounded by the wrapper           | current static integration invariant     |
-| all-exit respawn  | Respawn after every child exit, including status 0                  | current static OpenRC policy             |
-| explicit stop     | Administrator-requested OpenRC stop using the declared retry policy | current static contract; runtime unknown |
+| Term                | Definition                                                                                                                                                                               |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| valid temperature   | One successful, non-faulted hwmon input parse; zero/ambient values are valid for non-CPU sensors, while non-positive CPU readings do not satisfy CPU availability                        |
+| required CPU        | The discovered CPU/coretemp channel set required for safe operation; at least one selected channel must be usable and positive, while sibling non-positive readings do not invalidate it |
+| GPU-missing         | No temperature input below any exact numeric DRM card is present in the current topology                                                                                                 |
+| control temperature | Highest valid temperature in the current cycle                                                                                                                                           |
+| sensor fail-safe    | Mode that bypasses smoothing and attempts maximum fan speed because required thermal input is unsafe                                                                                     |
+| config-failsafe     | Mode that bypasses curves and attempts maximum fan speed because any fan policy is invalid or unreadable                                                                                 |
+| control-error       | Fatal loss of the ability to establish or command maximum fan speed                                                                                                                      |
+| target RPM          | Requested fan output after policy and clamping; not a tachometer measurement                                                                                                             |
+| actual RPM          | One diagnostic tachometer read, or `unknown` when it cannot be read or parsed                                                                                                            |
+| daemon PID          | PID written by t2fand to `/run/t2fand.pid`; supervisor state is separate                                                                                                                 |
 
 ## Stable requirements
 
-Requirement IDs are stable. A changed contract receives a new ID; prior meaning
-is retained below as superseded history.
+Requirement IDs are stable. A changed contract receives a new ID. Prior
+requirements remain below as historical evidence even when superseded.
 
-| ID        | Requirement                                                                                                                                                                                                                                                                                                                                                                                                                                | Status                                         | Acceptance evidence                                                            |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------- | ------------------------------------------------------------------------------ |
-| `REQ-001` | Refuse startup when effective UID is not zero and print `T2 Fan Daemon must be run as root`.                                                                                                                                                                                                                                                                                                                                               | documented daemon implementation               | `t2fand:102-105`; execution unverified                                         |
-| `REQ-002` | Accept any existing path matched by the initial T2 fan glob; if none exists, print `Fan not found` and exit 1. This does not prove later direct `fan*_input` discovery finds a fan.                                                                                                                                                                                                                                                        | documented daemon implementation               | `t2fand:107-117`; execution unverified                                         |
-| `REQ-003` | Require an existing CPU-glob path and `get_cpu_temp() != -1`; otherwise print `CPU temperature sensor not found` and exit 1. Textual `0` is skipped; parsed `-1` °C collides with the sentinel.                                                                                                                                                                                                                                            | documented daemon implementation               | `t2fand:75-84,119-132`; execution unverified                                   |
-| `REQ-004` | Use `/run/t2fand.pid`, reject a PID with an existing `/proc/<pid>`, and remove a stale PID file before continuing.                                                                                                                                                                                                                                                                                                                         | documented daemon implementation               | `t2fand:13-14,140-150`; identity and execution unverified                      |
-| `REQ-005` | Discover direct `fan*_input` children of the first matched fan directory and construct one `Fan` per input. Discovery may yield `fanCount == 0`; startup then continues with no controlled fans.                                                                                                                                                                                                                                           | documented daemon implementation               | `t2fand:152-155`; hardware coverage unverified                                 |
-| `REQ-006` | Read integer fan limits and input, clamp requested speed to the limits, and write the integer to the fan output. The main loop does not call `get_speed`.                                                                                                                                                                                                                                                                                  | documented daemon implementation               | `t2fand:20-35,250-251`; sysfs behavior untested                                |
-| `REQ-007` | Write `1` to each manual file before control and attempt `0` for each fan during SIGTERM/SIGINT cleanup.                                                                                                                                                                                                                                                                                                                                   | documented daemon implementation               | `t2fand:37-41,231-233`; hardware behavior untested                             |
-| `REQ-008` | If `/etc/t2fand.conf` is absent, generate `Fan1` through `FanN` with `55`, `75`, `linear`, and `false` defaults.                                                                                                                                                                                                                                                                                                                           | documented daemon implementation               | `t2fand:173-185`; execution unverified                                         |
-| `REQ-009` | Require four options in every detected fan section and accept only `linear`, `exponential`, or `logarithmic`; invalid or missing configuration prints an error and exits 1. Numeric conversion failures are not explicitly handled.                                                                                                                                                                                                        | documented daemon implementation               | `t2fand:187-228`; edge cases unverified                                        |
-| `REQ-010` | Exact `always_full_speed == "true"` selects maximum speed; otherwise apply the existing ordered thresholds and curve rules.                                                                                                                                                                                                                                                                                                                | documented daemon implementation               | `t2fand:43-72`; execution and math untested                                    |
-| `REQ-011` | Preserve the existing linear, cubic exponential, and `math.log` logarithmic expressions.                                                                                                                                                                                                                                                                                                                                                   | documented daemon implementation               | `t2fand:50-72`; numerical results untested                                     |
-| `REQ-012` | Select CPU, or the greater CPU/GPU value when GPU is marked available; retain at most five samples, round the mean to two decimals, update every fan, and sleep one second per loop. Post-startup CPU `-1` is not revalidated.                                                                                                                                                                                                             | documented daemon implementation               | `t2fand:235-253`; timing and hardware untested                                 |
-| `REQ-013` | Handled SIGTERM/SIGINT prints `T2 Fan Daemon is shutting down...`, sequentially attempts manual-mode disable for every fan, attempts PID removal, and exits. Prior fan mode is not restored.                                                                                                                                                                                                                                               | documented daemon implementation               | `t2fand:158-171`; signal and hardware behavior untested                        |
-| `REQ-014` | Historical systemd unit contract: `Type=simple`, `/usr/bin/t2fand`, `PIDFile=/run/t2fand.pid`, `Restart=always`, `RestartSec=2`, and installability for `default.target`.                                                                                                                                                                                                                                                                  | **superseded by `REQ-023`**                    | Prior `t2fand.service:1-12`; retained historical evidence                      |
-| `REQ-015` | Historical systemd-only `make install`: copy `t2fand` to `/usr/bin` and the unit to `/usr/lib/systemd/system`, modes 0700/0644, no compilation.                                                                                                                                                                                                                                                                                            | **superseded by `REQ-024`**                    | Prior Makefile; retained historical evidence                                   |
-| `REQ-016` | Historical package contract: package metadata named `t2fand-openrc` while packaging the executable and systemd unit only.                                                                                                                                                                                                                                                                                                                  | **superseded by `REQ-025`**                    | Prior PKGBUILD; retained historical evidence                                   |
-| `REQ-017` | The package workflow retains its checked-in push/PR triggers, `ubuntu-latest`, checkout step, marker gates, package artifact upload, and release configuration. Actual CI, tags, actions, and remote behavior remain `unknown`.                                                                                                                                                                                                            | documented workflow configuration              | `.github/workflows/build.yml:1-62`; execution unverified                       |
-| `REQ-018` | Retain root `t2fand.initd` with `#!/sbin/openrc-run`, `command=/usr/bin/t2fand`, `supervisor="supervise-daemon"`, `respawn_delay="2"`, `respawn_max="0"`, `supervise_daemon_args="--respawn-delay-step 0"`, and `retry="SIGTERM/5"`. It must not set `pidfile` or background/daemonization variables.                                                                                                                                      | current static source; runtime unknown         | `t2fand.initd:1-9`; source inspection                                          |
-| `REQ-019` | Historical selector contract: `INIT_SYSTEM` accepts `auto`, `systemd`, or `openrc`, with fail-closed marker detection and selected service installation.                                                                                                                                                                                                                                                                                   | **superseded by `REQ-024`**                    | Prior Makefile; retained historical evidence                                   |
-| `REQ-020` | Historical package contract: package name `t2fand-openrc`, version `1.2.0-1`, and direct installation of the executable plus both service definitions.                                                                                                                                                                                                                                                                                     | **superseded by `REQ-025`**                    | Prior PKGBUILD; retained historical evidence                                   |
-| `REQ-021` | Historical systemd-authoritative contract: unchanged systemd unit was authority and OpenRC was only its equivalent; both wrapped the foreground daemon.                                                                                                                                                                                                                                                                                    | **superseded by `REQ-023` and `REQ-026`**      | Prior unit and OpenRC inspection; retained historical evidence                 |
-| `REQ-022` | Historical dual-manager lifecycle contract: both integrations respawned all exits with no cap and a two-second delay; explicit stop was not to respawn.                                                                                                                                                                                                                                                                                    | **superseded by `REQ-026`**                    | Prior integration inspection; runtime unverified                               |
-| `REQ-023` | OpenRC is the sole supported service manager and `t2fand.initd` is the sole service-manager definition. `t2fand.service` is deleted; no systemd artifact, systemd workflow, or dual-manager operation is supported.                                                                                                                                                                                                                        | current static implementation                  | `t2fand.service` absent; `t2fand.initd` sole definition; source inspection     |
-| `REQ-024` | `make install` is unconditional OpenRC installation with no `INIT_SYSTEM`, selector, auto-detection, `PREFIX`, or systemd directory. It must honor `DESTDIR`, overridable `BINDIR` defaulting to `/usr/bin`, and overridable `OPENRC_INITDDIR` defaulting to `/etc/init.d`; perform no compilation; install only `t2fand` mode 0700 and `t2fand.initd` as `t2fand` mode 0755.                                                              | current static implementation                  | `Makefile:1-9`; staged result unknown                                          |
-| `REQ-025` | PKGBUILD must retain `pkgname=t2fand`, retain current package identity and metadata unless separately authorized, bump `pkgrel` from 1 to 2, and package exactly `/usr/bin/t2fand` mode 0700 and `/etc/init.d/t2fand` mode 0755. It must not create or package a systemd directory or unit and must not add or claim an Arch OpenRC runtime dependency.                                                                                    | current static implementation                  | `PKGBUILD:2-20`; package build unknown                                         |
-| `REQ-026` | OpenRC must run `/usr/bin/t2fand` as the already-foreground daemon through `supervise-daemon`; the daemon owns `/run/t2fand.pid`, and the supervisor must keep separate state. Every child exit, including status 0, must respawn with unlimited count and an exact constant two-second delay. `retry="SIGTERM/5"` and explicit stop must terminate supervision without respawn.                                                           | current static implementation; runtime unknown | `t2fand.initd:1-9` and daemon source semantics; no lifecycle execution claimed |
-| `REQ-027` | The OpenRC wrapper must declare no `pidfile`, background/daemonization setting, or network dependency. Installation must not start, stop, restart, enable, disable, reload, or daemon-reload any service manager.                                                                                                                                                                                                                          | current static safety/install invariant        | `t2fand.initd:1-9`, `Makefile:1-9`; no host action claimed                     |
-| `REQ-028` | The supported operator service workflow is OpenRC only: use `rc-service t2fand` with start, stop, restart, or status, with optional `rc-update add t2fand default`; installation uses `make install` or `makepkg`. The Python daemon remains a foreground executable invoked by the OpenRC script as `/usr/bin/t2fand`; source-level direct execution remains an executable/process fact, not a second supported service-manager workflow. | current static workflow contract               | OpenRC-only source/workflow inspection; execution unknown                      |
+### Historical requirements retained
+
+| ID        | Prior requirement                                                                                                                                                                                                                                                                                                                                                                                                                                             | Status                                                                      |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `REQ-001` | Refuse non-root startup and print `T2 Fan Daemon must be run as root`.                                                                                                                                                                                                                                                                                                                                                                                        | historical baseline; retained by `REQ-029`                                  |
+| `REQ-002` | Accept any existing path matched by the initial T2 fan glob; otherwise print `Fan not found` and exit 1.                                                                                                                                                                                                                                                                                                                                                      | superseded by `REQ-031`, `REQ-037`                                          |
+| `REQ-003` | Require an existing CPU-glob path and `get_cpu_temp() != -1`; print `CPU temperature sensor not found` and exit 1 on failure.                                                                                                                                                                                                                                                                                                                                 | superseded by `REQ-031`, `REQ-033`                                          |
+| `REQ-004` | Use `/run/t2fand.pid`, reject a live `/proc/<pid>`, and remove a stale PID file.                                                                                                                                                                                                                                                                                                                                                                              | narrowed/superseded by `REQ-029`, `REQ-042`                                 |
+| `REQ-005` | Discover direct `fan*_input` children of the first matched fan directory; zero fans may continue.                                                                                                                                                                                                                                                                                                                                                             | superseded by `REQ-037`                                                     |
+| `REQ-006` | Read fan limits/input, clamp requested speed, and write integer output; main loop does not call `get_speed`.                                                                                                                                                                                                                                                                                                                                                  | superseded by `REQ-037`, `REQ-038`, `REQ-040`                               |
+| `REQ-007` | Write manual `1` before control and attempt manual `0` during SIGTERM/SIGINT cleanup.                                                                                                                                                                                                                                                                                                                                                                         | superseded by `REQ-042`                                                     |
+| `REQ-008` | Generate `Fan1`…`FanN` with `55`, `75`, `linear`, `false` defaults when config is absent.                                                                                                                                                                                                                                                                                                                                                                     | retained by `REQ-036`                                                       |
+| `REQ-009` | Require four options and accept `linear`, `exponential`, or `logarithmic`; invalid config printed an error and exited 1.                                                                                                                                                                                                                                                                                                                                      | superseded by `REQ-036`                                                     |
+| `REQ-010` | Exact `always_full_speed == "true"` selects maximum; otherwise use ordered thresholds and curves.                                                                                                                                                                                                                                                                                                                                                             | superseded by `REQ-036`, `REQ-039`                                          |
+| `REQ-011` | Preserve the linear, cubic exponential, and `math.log` logarithmic expressions.                                                                                                                                                                                                                                                                                                                                                                               | retained by `REQ-039`                                                       |
+| `REQ-012` | Select CPU or greater CPU/GPU, retain at most five samples, round mean to two decimals, update every fan, and sleep one second.                                                                                                                                                                                                                                                                                                                               | superseded by `REQ-030`, `REQ-033`, `REQ-034`, `REQ-039`                    |
+| `REQ-013` | Handled SIGTERM/SIGINT printed shutdown text, disabled manual mode sequentially, attempted PID removal, and exited.                                                                                                                                                                                                                                                                                                                                           | superseded by `REQ-042`                                                     |
+| `REQ-014` | Historical systemd unit: simple foreground command, `/run/t2fand.pid`, always restart, two-second delay, default target.                                                                                                                                                                                                                                                                                                                                      | superseded by `REQ-023`, `REQ-043`                                          |
+| `REQ-015` | Historical systemd-only install copied the daemon and systemd unit with modes 0700/0644.                                                                                                                                                                                                                                                                                                                                                                      | superseded by `REQ-024`, `REQ-050`                                          |
+| `REQ-016` | Historical package metadata named `t2fand-openrc` while packaging the executable and systemd unit.                                                                                                                                                                                                                                                                                                                                                            | superseded by `REQ-025`, `REQ-050`                                          |
+| `REQ-017` | Existing GitHub Actions push/PR workflow retains its triggers, runner, gates, artifact, and release configuration; execution unknown.                                                                                                                                                                                                                                                                                                                         | retained; unrelated to this revision                                        |
+| `REQ-018` | Existing OpenRC script invokes `/usr/bin/t2fand` through `supervise-daemon` with two-second delay, unlimited respawn, zero delay step, and `retry="SIGTERM/5"`; no pidfile/backgrounding.                                                                                                                                                                                                                                                                     | superseded by `REQ-043`, `REQ-044`                                          |
+| `REQ-019` | Historical `INIT_SYSTEM` selector accepted `auto`, `systemd`, or `openrc` with fail-closed marker detection.                                                                                                                                                                                                                                                                                                                                                  | superseded by `REQ-024`                                                     |
+| `REQ-020` | Historical package was `t2fand-openrc`, version `1.2.0-1`, and shipped both service definitions.                                                                                                                                                                                                                                                                                                                                                              | superseded by `REQ-025`, `REQ-050`                                          |
+| `REQ-021` | Historical systemd-authoritative contract treated OpenRC as its equivalent; both wrapped the foreground daemon.                                                                                                                                                                                                                                                                                                                                               | superseded by `REQ-023`                                                     |
+| `REQ-022` | Historical dual-manager contract respawned every exit without a cap after two seconds and did not respawn on explicit stop.                                                                                                                                                                                                                                                                                                                                   | superseded by `REQ-043`                                                     |
+| `REQ-023` | OpenRC is the sole supported manager and `t2fand.initd` the sole service definition; no systemd artifact or workflow.                                                                                                                                                                                                                                                                                                                                         | retained by `REQ-043`, `REQ-050`                                            |
+| `REQ-024` | `make install` is unconditional OpenRC installation, honors `DESTDIR`, `BINDIR=/usr/bin`, `OPENRC_INITDDIR=/etc/init.d`, performs no compilation, and installs only daemon 0700/init 0755.                                                                                                                                                                                                                                                                    | retained by `REQ-050`                                                       |
+| `REQ-025` | Package name is `t2fand`; package payload is daemon 0700 and OpenRC init 0755; no systemd payload or guessed OpenRC dependency.                                                                                                                                                                                                                                                                                                                               | superseded/narrowed by `REQ-050`                                            |
+| `REQ-026` | OpenRC runs the foreground daemon, daemon owns `/run/t2fand.pid`, and every exit respawns unlimited after exactly two seconds; explicit stop suppresses respawn.                                                                                                                                                                                                                                                                                              | superseded by bounded `REQ-043`; retained PID/foreground portions           |
+| `REQ-027` | No OpenRC pidfile/backgrounding/network dependency; installation performs no service state changes.                                                                                                                                                                                                                                                                                                                                                           | retained by `REQ-043`, `REQ-044`                                            |
+| `REQ-028` | Supported operator workflow is OpenRC `rc-service` with optional `rc-update`; direct Python execution is not a second manager workflow.                                                                                                                                                                                                                                                                                                                       | retained by `REQ-043`                                                       |
+| `REQ-033` | CPU remains mandatory: no usable CPU reading, non-positive CPU reading, malformed CPU data, or inaccessible required CPU input enters sensor fail-safe immediately. At least one usable system temperature is required. Valid non-CPU low/ambient readings are accepted. Any discovered non-CPU read/parse/fault failure enters sensor fail-safe for that cycle; an absent source is not itself a fault. Select the highest valid reading across all sources. | superseded by `REQ-048`; stricter non-positive-CPU rule retained as history |
+
+### Revised requirements
+
+| ID        | Requirement                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Acceptance evidence                                                                                                                |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `REQ-029` | Keep root-required, foreground, single-process Python execution. Put orchestration in import-safe `main(argv=None)` under the normal main guard. Importing for tests must not exit, check root, install signals, touch real sysfs, `/etc`, or `/run`. Use snake_case names, named state/config objects, focused discovery/parse/select/control/telemetry/cleanup functions, precise exceptions, module and useful API docstrings.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | checked-in source; runtime unverified                                                                                              |
+| `REQ-030` | Preserve one-second sampling, at most five valid normal samples, fractional Celsius, existing curves, ordinary smoothing, and immediate maximum on any fail-safe or valid configured full speed. Re-scan and reopen sysfs paths each cycle; retain no open sysfs handles.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | checked-in source and test definitions; execution unverified                                                                       |
+| `REQ-031` | Each cycle enumerate `/sys/class/hwmon/hwmon*/temp*_input`, existing CPU/coretemp paths, and `device/hwmon/hwmon*/temp*_input` below every DRM entry whose basename exactly matches `^card\d+$`. Exclude connector names such as `card0-DP-1`. Union candidates and deduplicate by resolved path.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | checked-in source and fake-sysfs test definitions; runtime unknown                                                                 |
+| `REQ-032` | Read each selected input exactly once per cycle and parse signed integer millidegrees Celsius. Read optional `name`, `tempN_label`, DRM identity, and path fallback to derive a stable human label. Optional labels never gate operation. A present fault flag reporting a fault makes that sensor unavailable for the cycle. No `-1`, fabricated high value, or other numeric sentinel represents failure; failed readings are `unknown`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | checked-in source and fake-sysfs test definitions; execution unverified                                                            |
+| `REQ-034` | GPU is optional. GPU sensors are those resolved below exact numeric DRM cards. If none are present, continue with other valid sources and emit one warning on transition into `gpu-missing`; emit one recovery notice when GPU temperatures reappear. Do not repeat unchanged warnings every second; verbose telemetry continues to show `gpu_temps=missing`. Sensors/cards may appear or disappear across cycles.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | checked-in source and topology test definitions; execution unverified                                                              |
+| `REQ-035` | Externally report at least these modes: `curve`, `configured-full`, `config-failsafe`, `sensor-failsafe`, `control-error`, and `shutting-down`. `curve` is valid automatic policy; `configured-full` is valid `always_full_speed=true`; fail-safe modes command maximum; `control-error` is fatal; shutdown is the common cleanup state. State and reason transitions are reported.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | checked-in source and test definitions; execution unverified                                                                       |
+| `REQ-036` | Sensor/config fail-safe bypasses smoothing and immediately attempts every fan's known maximum. Sensor fail-safe stays alive and retries discovery once per second while control remains available. Return to normal policy only after five consecutive cycles in which all required inputs are valid; reset the count on any invalid cycle, clear old history, then collect the five new maxima before normal smoothing. Configuration is read once at startup; config-failsafe persists until restart after repair.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | checked-in source and recovery test definitions; execution unverified                                                              |
+| `REQ-037` | Configuration keeps four options and generated defaults: `low_temp=55`, `high_temp=75`, `speed_curve=linear`, `always_full_speed=false`. Validate every detected fan before normal curves. Reject missing sections/options, unreadable or malformed INI, malformed/non-finite thresholds, invalid curves, `low_temp >= high_temp`, and Boolean text other than case-insensitive `true`/`false` after INI whitespace handling. Any defect globally selects config-failsafe, commands every fan maximum, prints the exact section/key or file problem, and never silently edits/normalizes administrator config. A valid `true` selects `configured-full`, not an error. Config-generation failure takes the same safe path when maxima are available.                                                                                                                                                                                                                                                                                                                                                                                                                                                      | checked-in source and configuration test definitions; execution unverified                                                         |
+| `REQ-038` | Require at least one complete controllable fan. Read usable integer min/max limits, require a usable maximum, clamp every requested output to the reported range, enable manual mode before normal control, and write outputs by reopening sysfs paths. No fan, unreadable maximum, inability to enable manual mode, inability to write maximum, or equivalent loss of control authority is fatal. Before fatal exit, attempt maximum on every still-controllable fan, perform cleanup, and exit nonzero for OpenRC recovery.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | superseded by `REQ-049`; retained historical evidence                                                                              |
+| `REQ-039` | Preserve threshold behavior: at/below low uses minimum, at/above high uses maximum, and intermediate values use the existing linear, cubic `exponential`, or `math.log` `logarithmic` expressions. Validate or guard calculations so they cannot raise or produce non-finite control output; unsafe policy follows config-failsafe. `always_full_speed=true` takes precedence.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | checked-in source and curve test definitions; execution unverified                                                                 |
+| `REQ-040` | Use `argparse` with `-v`/`--verbose`; unknown arguments fail clearly before hardware mutation. Use direct `print()` output, explicit stdout/stderr, formatted strings, and `flush=True`; do not use Python logging, direct syslog APIs, or spawn logger from Python. Default output includes startup/shutdown summaries, warnings/errors, and fail-safe, GPU-missing, and recovery transitions, but no normal per-second line. Verbose output emits one compact flushed record per second.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | checked-in source and CLI/output test definitions; execution unverified                                                            |
+| `REQ-041` | Every verbose record includes every discovered sensor label and value or `unknown`, `gpu_temps=missing` when applicable, highest current valid temperature, rolling mean only during normal smoothing, mode/status/reason, and each fan's low/high, curve, configured full-speed value, `target_rpm`, and `actual_rpm` or `unknown`. Actual RPM is diagnostic; a failed read never suppresses the target and forces all controllable fans maximum for safety. Repeated default errors print on state/reason change and at most once per 60-second reminder interval.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | checked-in source and telemetry test definitions; execution unverified                                                             |
+| `REQ-042` | SIGINT/SIGTERM handlers only request shutdown; they perform no file I/O. After manual mode begins, one outer `try/finally` owns cleanup. Fatal paths independently attempt maximum for every fan first, independently disable manual mode for every fan next, and always attempt PID removal. Preserve and print the original failure and cleanup failures; fatal exit is nonzero. Cleanup is best effort and cannot run after SIGKILL, power loss, kernel panic, interpreter/native abort, or unavailable hardware write authority. Malformed PID files produce a clear diagnostic and safe stale-file recovery, not an unhandled parse exception.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | checked-in source and cleanup/signal/PID test definitions; execution unverified                                                    |
+| `REQ-043` | OpenRC remains sole supported manager and `t2fand.initd` sole service artifact. It runs `/usr/bin/t2fand` foreground through `supervise-daemon`, does not set `pidfile`, background, daemonization, or network dependencies, and keeps daemon ownership of `/run/t2fand.pid`. Use normal local-filesystem dependency ordering and soft `logger` use. Preserve a two-second base respawn delay, but bound crash loops to five respawns in a 60-second window and use a two-second respawn-delay step for backoff. Every child exit is eligible within that bound; explicit `rc-service ... stop` suppresses respawn. Selected directives and their supported OpenRC semantics must be documented and statically checked.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | checked-in init definition and static test definitions; OpenRC runtime unknown                                                     |
+| `REQ-044` | Route OpenRC stdout through `output_logger="/usr/bin/logger -t t2fand -p daemon.info"` and stderr through `error_logger="/usr/bin/logger -t t2fand -p daemon.err"`. Make daemon arguments configurable without editing the init script: source normal `/etc/conf.d/t2fand` value `t2fand_args` into `command_args`, default empty, so `t2fand_args="--verbose"` is supported. Add direct `util-linux` runtime dependency. Do not require a particular syslog daemon; logger submits to the administrator-selected receiver.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | checked-in init/package definitions and static test definitions; logger delivery unknown                                           |
+| `REQ-045` | Prior install/package contract: keep `make install` unconditional OpenRC-only, with no compilation or service action, honor `DESTDIR`, overridable `BINDIR` default `/usr/bin`, and `OPENRC_INITDDIR` default `/etc/init.d`; install only daemon 0700 and init script 0755. Keep package name `t2fand`, retain `linux-t2`, `python`, and `git`, add `util-linux`, and package exactly `/usr/bin/t2fand` and `/etc/init.d/t2fand`; the prior release was `1.2.0-3`. No alternate artifact or payload is allowed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | superseded by `REQ-050`; historical release/install contract retained         |
+| `REQ-046` | Add a standard-library `unittest` suite using temporary fake sysfs/config/run trees and mocks. Add and document project-native `make test`; tests require neither root, real `/sys`, fan hardware, OpenRC, nor a syslog daemon.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | checked-in test source and target; `make test` outcome unverified (not run)                                                        |
+| `REQ-047` | Prior documentation-placement contract: rewrite affected operator documentation to place the full safety, discovery, smoothing, configuration, fail-safe, mode, telemetry, OpenRC, logger, cleanup, testing, and cautious manual-check contract in the README. Never instruct deletion of live sysfs nodes or obstruction of real cooling sensors. Remove stale CPU/card0-only or unsupported-manager claims from current docs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | superseded by `REQ-051`; historical documentation requirement retained         |
+| `REQ-048` | CPU remains mandatory, but CPU availability is satisfied when at least one selected CPU/coretemp channel is successfully read, fault-free, parsed, and positive. A non-positive CPU reading is a valid reading that does not satisfy availability; it does not invalidate a positive sibling channel. If no selected CPU channel is usable and positive, enter sensor fail-safe immediately. Any discovered selected sensor input read/parse/fault failure, including a CPU channel, enters sensor fail-safe for that cycle even when another CPU channel is positive. At least one usable system temperature is required. Valid non-CPU low/ambient readings are accepted; an absent source is not itself a fault. Select the highest valid reading across all sources, with failures `unknown` and no fabricated temperatures or numeric sentinels.                                                                                                                                                                                                                                                                                                                                                     | checked-in source and fake-sysfs test definitions; execution unverified                                                            |
+| `REQ-049` | Require at least one discovered fan and require every discovered, resolved-path-deduplicated fan candidate to be complete and controllable. The discovered set is the union of T2 and class-hwmon fan candidates, deduplicated by resolved base path; one complete fan does not mask another candidate with an unreadable/incomplete limit or invalid range. Each candidate must provide usable integer minimum and maximum limits with minimum no greater than maximum. No fan, any unreadable fan maximum, any incomplete/invalid discovered fan, inability to enable manual mode, inability to write a required maximum, or equivalent loss of control authority is fatal `control-error`; no candidate may be silently ignored or used as an alternate. Clamp each requested output to that fan's reported range and reopen sysfs paths for operations. For every fatal-control path, independently attempt each discovered fan's known maximum, record a missing maximum as a failed attempt, continue after per-fan failures, then independently attempt manual-mode disable for each fan and attempt PID removal; preserve the original and cleanup failures and exit nonzero for OpenRC recovery. | checked-in source enforces all-candidate rejection and targeted partial-fan fixture coverage is present; test execution unverified |
+| `REQ-050` | Keep `make install` unconditional OpenRC-only, with no compilation or service action, honor `DESTDIR`, overridable `BINDIR` default `/usr/bin`, and `OPENRC_INITDDIR` default `/etc/init.d`; install exactly daemon `/usr/bin/t2fand` mode 0700 and init script `/etc/init.d/t2fand` mode 0755. Keep package name `t2fand`, Arch `x86_64` and GPL3 metadata, release `2.0.0-1` (`pkgver=2.0.0`, `pkgrel=1`), dependencies `linux-t2`, `python`, and `util-linux`, and `git` as a build dependency. Package exactly those two files; no alternate artifact, service definition, selector, or payload is allowed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | checked-in Makefile and PKGBUILD; package build, staging, and installation unknown |
+| `REQ-051` | Keep README as concise operator onboarding. It must retain pointers for operator actions, safety, configuration, OpenRC operation, observability, and project-native testing, while exhaustive limits, implementation behavior, fail-safe semantics, modes, telemetry fields, and design truth remain owned by `SPEC.md` and `CONTEXT.md`. Summaries must not weaken or redefine the safety/product requirements in this contract, and documentation must not instruct deletion of live sysfs nodes, obstruction of cooling sensors, or unsupported service-manager workflows.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | documentation review remains required; current conformance and runtime outcomes unverified |
 
 ## Runtime rules
 
-### Daemon behavior
+### Startup
 
-The daemon rules remain unchanged by this contract: root startup, T2 fan and
-CPU/GPU discovery, PID-file handling, configuration generation/validation,
-manual-mode control, five-sample smoothing, curve calculation, one-second
-polling, and handled signal cleanup follow `REQ-001`–`REQ-013`. The daemon's
-hardware and failure consequences remain `unknown`.
+The daemon validates root, parses CLI arguments, handles PID state, discovers
+fans, and requires every discovered candidate to be complete and controllable.
+It then generates configuration only when absent, validates all fan policies,
+installs signal-request handlers, enables manual mode, and enters the outer
+lifecycle `try/finally`. A fan-discovery or control-authority defect is
+`control-error`; a complete fan does not mask another discovered incomplete fan.
+A configuration defect does not terminate before fan protection. If known maxima
+are available, all fans go to maximum and the process remains alive in
+`config-failsafe`; loss of fan control authority exits nonzero.
 
-### OpenRC supervision
+### Sampling and states
 
-The sole service definition invokes the existing foreground command with
-`supervise-daemon`. The wrapper must not background or daemonize it, set a
-`pidfile`, or replace `/run/t2fand.pid`; that PID file belongs to the daemon and
-supervisor state is separate. `respawn_delay=2` and `--respawn-delay-step 0`
-define a constant two-second delay. `respawn_max=0` defines unlimited respawn.
-All child exits, including status 0, are respawnable. `retry="SIGTERM/5"` is the
-explicit stop contract: an administrator stop must end supervision and must not
-enter respawn. These are current static integration claims; local OpenRC
-lifecycle behavior is unknown.
+Each one-second cycle rediscoveries sensors, reads each selected input once,
+records unknown failures without numeric sentinels, and selects the maximum
+valid temperature. CPU availability requires at least one usable positive CPU
+channel; a non-positive sibling does not invalidate it, but any discovered
+sensor input or fault read/parse failure invalidates the cycle. Normal `curve`
+control appends only valid selected maxima to the five-sample buffer and uses
+its rounded two-decimal mean. Fail-safe control does not append or use the
+rolling mean. Five consecutive fully valid required cycles clear the old buffer;
+the five recovery maxima become the new normal history before curve smoothing
+resumes. A valid always-full policy uses `configured-full` after required sensor
+recovery.
+
+Sensor failure with writable maxima is recoverable and remains alive. Failed
+sensor readings, including CPU readings, are reported as `unknown`; a positive
+CPU sibling does not mask another discovered read/parse/fault failure. GPU
+absence is a topology state, not by itself a failure. Any inability to establish
+or command maximum is a fatal control error. Configuration fail-safe remains
+until restart.
+
+### Curves and fan output
+
+Every target is clamped to each fan's reported integer min/max before writing.
+Normal curves retain the existing formulas and threshold ordering. Fan output,
+manual-mode writes, limits, and tachometer reads reopen sysfs paths as needed;
+no persistent file object is retained. Actual RPM read failure reports
+`actual_rpm=unknown` and commands maximum for all controllable fans.
+
+### Cleanup
+
+Signal handlers set a shutdown request. The normal lifecycle observes it,
+reports `shutting-down`, and runs common cleanup. Fatal cleanup first attempts
+maximum output independently, then attempts manual-mode disable independently,
+then attempts PID removal regardless of earlier errors. It reports all cleanup
+failures alongside the original failure. No cleanup claim covers SIGKILL, power
+loss, kernel panic, interpreter/native abort, or hardware that no longer accepts
+writes.
 
 ## Interfaces
 
-| ID       | Interface                   | Contract                                                                                                                                                  | Status                                                       |
-| -------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| `IF-001` | CLI/process                 | Invoke `t2fand` directly; no command-line arguments or foreground option is documented.                                                                   | daemon interface; argument behavior unknown                  |
-| `IF-002` | INI file                    | `/etc/t2fand.conf` contains `Fan1` through `FanN` and four required keys per detected fan.                                                                | documented; read at startup                                  |
-| `IF-003` | Linux sysfs fan API         | Read `<base>_max`, `<base>_min`, `<base>_input`; write `<base>_output` and `<base>_manual`.                                                               | documented; device compatibility unknown                     |
-| `IF-004` | Linux sysfs temperature API | Read the existing CPU/GPU paths and millidegree text; textual `0` is skipped.                                                                             | documented; GPU support unknown                              |
-| `IF-005` | PID file                    | `/run/t2fand.pid` stores the decimal daemon PID; live `/proc/<pid>` rejects startup and missing `/proc/<pid>` permits stale removal.                      | daemon-owned; identity locking absent                        |
-| `IF-006` | POSIX signals               | SIGTERM and SIGINT invoke sequential cleanup, PID removal attempt, and process exit.                                                                      | documented; failure paths unknown                            |
-| `IF-007` | systemd unit                | Historical interface: `Type=simple`, `Restart=always`, `RestartSec=2`, `ExecStart=/usr/bin/t2fand`, `PIDFile=/run/t2fand.pid`, `WantedBy=default.target`. | **superseded by `IF-017`**                                   |
-| `IF-008` | Make target                 | Historical selector interface accepting `INIT_SYSTEM` and systemd/OpenRC directory overrides.                                                             | **superseded by `IF-014`**                                   |
-| `IF-009` | Arch package                | Historical package interface installing the executable and both service definitions.                                                                      | **superseded by `IF-015`**                                   |
-| `IF-010` | GitHub Actions              | Push/PR package workflow with its checked-in gates and artifact/release configuration.                                                                    | retained; execution unknown                                  |
-| `IF-011` | OpenRC init script          | Root `t2fand.initd` is installed as `/etc/init.d/t2fand` and supervises `/usr/bin/t2fand`.                                                                | current static sole service interface; runtime unknown       |
-| `IF-012` | Service-manager selection   | Historical `INIT_SYSTEM=auto` and explicit systemd/openrc selector.                                                                                       | **superseded by `IF-014` and `IF-017`**                      |
-| `IF-013` | Supervisor state boundary   | Historical dual-manager boundary in which the daemon owned `/run/t2fand.pid` and OpenRC omitted `pidfile`.                                                | PID portion retained by `IF-016`; systemd portion superseded |
-| `IF-014` | Make target                 | `make install` accepts `DESTDIR`, `BINDIR`, and `OPENRC_INITDDIR` only for unconditional OpenRC staged installation.                                      | current static implementation; staged result unknown         |
-| `IF-015` | Arch package                | `makepkg` must produce the unchanged-name package with exactly the executable and OpenRC init script payload.                                             | current static implementation; build unknown                 |
-| `IF-016` | PID/supervisor boundary     | The daemon owns `/run/t2fand.pid`; OpenRC supervisor state is separate and no wrapper `pidfile` is allowed.                                               | current static implementation; runtime unknown               |
-| `IF-017` | Service-manager boundary    | OpenRC is the only supported manager and `/etc/init.d/t2fand` is the only service artifact.                                                               | current static implementation                                |
+| ID       | Interface                          | Contract                                                                                                                                                                                                                                                              | Status                                                                                   |
+| -------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `IF-001` | CLI/process                        | Foreground `t2fand`; `-v`/`--verbose`; unknown arguments fail before mutation.                                                                                                                                                                                        | checked-in source; runtime unverified                                                    |
+| `IF-002` | INI file                           | `/etc/t2fand.conf`; `Fan1`…`FanN`; four required keys; startup-only read; defaults as `REQ-037`.                                                                                                                                                                      | checked-in source; config runtime unknown                                                |
+| `IF-003` | Linux fan sysfs                    | Discover and deduplicate all fan candidates; read usable integer `<base>_max` and `<base>_min` with minimum no greater than maximum; write `<base>_output` and `<base>_manual`; reopen paths. Any incomplete candidate or loss of maximum-control authority is fatal. | checked-in source; hardware unknown                                                      |
+| `IF-004` | Linux temperature sysfs            | Global hwmon plus coretemp and exact numeric DRM-card ancestry; signed millidegrees; optional labels/fault metadata; at least one usable positive selected CPU channel required, while any selected input or fault read/parse failure is fail-safe.                   | checked-in source and fake-sysfs test definitions; hardware/runtime unknown              |
+| `IF-005` | PID file                           | Daemon-owned `/run/t2fand.pid`; decimal PID; malformed/stale handling per `REQ-042`; no supervisor reuse.                                                                                                                                                             | checked-in source and test definitions; runtime unverified                               |
+| `IF-006` | POSIX signals                      | SIGINT/SIGTERM request common cleanup only.                                                                                                                                                                                                                           | checked-in source and test definitions; runtime unverified                               |
+| `IF-007` | Historical systemd unit            | `Type=simple`, restart, PIDFile, and default-target interface from the prior unit.                                                                                                                                                                                    | superseded historical interface                                                          |
+| `IF-008` | Historical Make selector           | `INIT_SYSTEM` and systemd/OpenRC selector interface.                                                                                                                                                                                                                  | superseded historical interface                                                          |
+| `IF-009` | Historical Arch package            | Prior package installed executable and both service definitions.                                                                                                                                                                                                      | superseded historical interface                                                          |
+| `IF-010` | GitHub Actions                     | Existing push/PR package workflow and gates.                                                                                                                                                                                                                          | retained; execution unknown                                                              |
+| `IF-011` | OpenRC init script                 | `/etc/init.d/t2fand`, `/usr/bin/t2fand`, foreground `supervise-daemon`, directives in `REQ-043`, logger routing in `REQ-044`.                                                                                                                                         | checked-in init definition and static test definitions; OpenRC runtime unknown           |
+| `IF-012` | Historical service selector        | `INIT_SYSTEM=auto` and explicit systemd/OpenRC selection.                                                                                                                                                                                                             | superseded by OpenRC-only `IF-017`                                                       |
+| `IF-013` | Historical PID/supervisor boundary | Daemon PID ownership and OpenRC omission of `pidfile`.                                                                                                                                                                                                                | retained/narrowed by `IF-016`                                                            |
+| `IF-014` | Make install                       | `DESTDIR`, `BINDIR`, and `OPENRC_INITDDIR` unconditional OpenRC staging only.                                                                                                                                                                                         | checked-in Makefile; staging unverified                                                  |
+| `IF-015` | Arch package                       | Unchanged package name; exactly daemon/init payload plus declared dependencies.                                                                                                                                                                                       | checked-in package definition; build/staging unknown                                     |
+| `IF-016` | PID/supervisor boundary            | Daemon owns `/run/t2fand.pid`; supervisor state is separate; wrapper `pidfile` forbidden.                                                                                                                                                                             | retained by `REQ-043`                                                                    |
+| `IF-017` | Service-manager boundary           | OpenRC only; `/etc/init.d/t2fand` only service artifact.                                                                                                                                                                                                              | checked-in source/package definitions; runtime unknown                                   |
+| `IF-018` | OpenRC argument configuration      | `/etc/conf.d/t2fand`, optional `t2fand_args`, passed as `command_args`; no shipped third runtime payload file.                                                                                                                                                        | checked-in init definition and static test definitions; runtime unknown                  |
+| `IF-019` | OpenRC logger transport            | `/usr/bin/logger` from util-linux; stdout `daemon.info`, stderr `daemon.err`, tag `t2fand`.                                                                                                                                                                           | checked-in init/package definitions and static test definitions; logger delivery unknown |
 
-## Runtime state and filesystem paths
+## Runtime state and paths
 
-| State/path                              | Meaning and ownership                                                                                                | Status                                                          |
-| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `/etc/t2fand.conf`                      | Persistent administrator configuration; generated only when absent and read at startup.                              | documented; exact mode unknown                                  |
-| `/run/t2fand.pid`                       | Decimal PID written by the daemon after startup checks; stale removal and handled-signal removal follow daemon code. | daemon-owned; cleanup limitations unknown                       |
-| OpenRC supervisor state                 | State for the supervised foreground child; must not claim the daemon PID file.                                       | current static integration; exact manager paths/runtime unknown |
-| `/etc/init.d/t2fand`                    | Installed copy of the sole checked-in OpenRC definition.                                                             | current static payload; staged result unknown                   |
-| `/usr/bin/t2fand`                       | Installed executable invoked by OpenRC.                                                                              | current static payload; staged result unknown                   |
-| Fan sysfs files                         | Kernel/device state read and written by the daemon.                                                                  | hardware runtime unknown                                        |
-| In-memory `temps`, `fans`, `fanConfigs` | Process-lifetime samples, fan objects, and policies.                                                                 | documented daemon state                                         |
+| State/path                 | Meaning and ownership                                                                                             |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `/etc/t2fand.conf`         | Administrator policy; generated only when absent; never normalized on validation failure; read once per start.    |
+| `/etc/conf.d/t2fand`       | Optional OpenRC administrator arguments; `t2fand_args` may enable `--verbose`; not a package payload requirement. |
+| `/run/t2fand.pid`          | Decimal daemon PID; daemon-owned; stale cleanup per contract; not authenticated locking.                          |
+| OpenRC supervisor state    | Separate manager state; must not claim daemon PID.                                                                |
+| `/etc/init.d/t2fand`       | Installed sole OpenRC definition, mode 0755.                                                                      |
+| `/usr/bin/t2fand`          | Installed extensionless Python executable, mode 0700.                                                             |
+| Fan sysfs files            | Kernel/device boundary; reopened for each operation.                                                              |
+| Hwmon temperature files    | Per-cycle discovered/read inputs; aliases deduplicated by resolved path.                                          |
+| `temps` history            | In-memory maximum temperatures; at most five valid normal/recovery samples; cleared on sensor recovery.           |
+| Mode/reason/topology state | In-memory externally reported state; transitions are logged, repeated reasons are rate-limited by default.        |
 
-The delivered source contains no systemd unit or systemd install/package path.
-Their absence from package or staged output remains an acceptance condition;
-package and staged-install results are unknown.
+## OpenRC supervision and operation
 
-## Workflows
-
-The following workflows are current static implementation contracts. Execution,
-staged installation, package creation, and runtime behavior remain unknown.
-
-### Product operation
-
-1. Install the executable and OpenRC definition through the unconditional OpenRC
-   path.
-2. Configure `/etc/t2fand.conf` as needed.
-3. Use OpenRC to start, stop, restart, or inspect `t2fand`.
-4. The manager supervises the existing foreground daemon; daemon startup,
-   polling, and signal cleanup remain governed by `REQ-001`–`REQ-013`.
-
-No systemd start, enable, status, restart, migration, or dual-manager product
-workflow remains supported.
-
-### Configuration workflow
-
-The first run generates 55 °C low, 75 °C high, linear, and no full-speed
-override for each detected fan. An administrator may edit the INI file. All four
-keys are required per detected fan and configuration is read only at startup.
-Live reload is not implemented; reload behavior is `unknown`.
-
-### Installation workflow
-
-The delivered Makefile has only the `.PHONY` `install` target, performs no
-compilation, and has no daemon prerequisite. It copies only:
-
-- `t2fand` to `$(DESTDIR)$(BINDIR)/t2fand` with mode 0700;
-- `t2fand.initd` to `$(DESTDIR)$(OPENRC_INITDDIR)/t2fand` with mode 0755.
-
-The Makefile uses `DESTDIR` for all copies. The source performs no start, stop,
-restart, enable, disable, reload, or daemon-reload action and makes no host
-service state change.
-
-### Package workflow
-
-The delivered `PKGBUILD` retains `pkgname=t2fand`, current
-version/target/license and declared existing dependencies unless separately
-authorized, sets `pkgrel` to 2, and directly installs exactly the two target
-files. It does not call a service selector, create a systemd directory, package
-a systemd unit, or add/claim an OpenRC runtime dependency. Local evidence does
-not name Arch's OpenRC runtime dependency; it is `unknown`.
-
-### Administrator service workflow
-
-The supported manager workflow is OpenRC:
+OpenRC is the only supported manager. The supported commands are:
 
 ```text
 rc-update add t2fand default       # optional enablement
@@ -236,137 +245,147 @@ rc-service t2fand stop
 rc-service t2fand restart
 ```
 
-The commands are current workflow contract examples, not executed validation.
-The OpenRC dependency set is unknown; no network dependency is permitted.
+The init script must use `#!/sbin/openrc-run`, `command=/usr/bin/t2fand`,
+`supervisor="supervise-daemon"`, `respawn_delay="2"`, finite `respawn_max="5"`,
+`respawn_period="60"`, and `supervise_daemon_args="--respawn-delay-step 2"`,
+plus `retry="SIGTERM/5"`. It must declare local filesystem ordering,
+`use logger`, and must define no network dependency, custom service manager,
+backgrounding, or supervisor `pidfile`.
 
-### Lifecycle, recovery, and release
+These values mean a base two-second delay, incremental two-second crash backoff,
+and no more than five automatic respawns in a 60-second crash window. The child
+may exit with any status and is eligible while within the bound. Explicit
+administrator stop suppresses recovery. OpenRC directive support and exact
+lifecycle results are not verified here.
 
-Every child exit, including status 0, is recovered by unlimited respawn after
-the constant two-second delay. Explicit stop suppresses respawn. SIGTERM and
-SIGINT cleanup remains daemon-owned. Stale PID handling is the documented
-recovery path; crash, SIGKILL, power-loss, cleanup failure, and hardware
-recovery outcomes are `unknown`.
+`output_logger` and `error_logger` route direct flushed application streams to
+the administrator-selected syslog receiver. The daemon does not invoke `logger`;
+no particular syslog daemon or persisted destination is required.
 
-The existing GitHub Actions push/PR package and release workflow remains in
-scope. CI, package build, release, tag, action, and remote-source outcomes are
-`unknown`; no CI or source-pinning change is part of this contract.
+## Installation and package contract
 
-## Constraints and invariants
+`make install` has no selector, compilation, service action, or alternate init
+branch. It honors only `DESTDIR`, `BINDIR`, and `OPENRC_INITDDIR`, and installs
+the two files and modes in `REQ-050`. The Arch package is named `t2fand` at
+release `2.0.0-1`, retains its checked-in metadata, retains `linux-t2`,
+`python`, and `git`, and includes `util-linux` for `/usr/bin/logger`. The
+package payload remains exactly the daemon and OpenRC init script. No package
+rename, systemd directory, unit, post-install service action, or guessed
+syslog daemon dependency is allowed.
 
-- Root privilege remains required by the daemon; normal installation targets
-  absolute system directories.
-- Daemon behavior, configuration, hardware paths, and existing package name are
-  unchanged unless a separate contract authorizes a change.
-- OpenRC is the only supported service manager and `t2fand.initd` is the only
-  service definition/payload.
-- The OpenRC command is the already-foreground daemon. No `pidfile`,
-  background/daemonization setting, or network dependency is allowed.
-- `/run/t2fand.pid` is daemon-owned; supervisor state is separate.
-- OpenRC respawns all child exits, with unlimited count and an exact constant
-  two-second delay; explicit stop suppresses respawn.
-- `make install` is unconditional OpenRC installation, honors only the stated
-  staging/directory variables, and performs no service actions.
-- Package payload is exactly `/usr/bin/t2fand` mode 0700 and
-  `/etc/init.d/t2fand` mode 0755. The systemd payload is absent.
-- `pkgname` remains `t2fand`; no package rename is authorized. Arch OpenRC
-  runtime dependency is `unknown`.
-- No hardware execution, service execution, host write, package build,
-  staged-install, or CI result is implied by this static source contract.
+## Workflows
 
-## Security, safety, and trust boundaries
+### Configuration
 
-The daemon is root-owned and can write `/run/t2fand.pid`, create
-`/etc/t2fand.conf` on first run, and write fan sysfs controls. Configuration and
-sysfs ownership/permission hardening are `unknown`. The PID check does not
-authenticate identity or provide atomic locking.
+First start generates one default section per detected fan. Administrators may
+edit the four options. The file is read once at startup; repair requires a
+restart. Invalid config globally requests maximum rather than terminating before
+fan protection. Config-generation failure follows the same path when fan maxima
+are controllable.
 
-The OpenRC wrapper shares the daemon's root and hardware boundary. It must not
-background the daemon, claim its PID file, or introduce a network dependency. No
-authentication, encryption, secret store, network listener, or new trust
-boundary is defined. No secret is recorded or handled by this change.
+### Service and logs
 
-Installation is staged with `DESTDIR` for acceptance inspection and must not
-perform service actions or host writes outside the requested destination. No
-service or hardware execution is authorized for this task.
+Install without starting or enabling any service. Optionally configure
+`/etc/conf.d/t2fand` with `t2fand_args="--verbose"`, then use OpenRC commands.
+Read routed output through the local syslog facility (`/var/log/messages`,
+`/var/log/daemon.log`, `logread`, or another administrator-selected location).
+Persisted logs require a running receiver; exact destination is unknown.
+
+### Recovery
+
+Sensor/config input failures with control authority remain alive at maximum and
+retry as specified. Control authority failures exit nonzero for bounded OpenRC
+supervision. Configuration recovery requires restart. Cleanup is best effort. No
+hardware, OpenRC, package, or syslog execution is claimed in this task.
+
+## Constraints, safety, and trust boundaries
+
+- Root and Linux sysfs remain required; exact hardware/model/kernel/distribution
+  support is unknown.
+- Every valid discovered temperature can influence control; the hottest value is
+  selected. CPU is mandatory through at least one usable positive selected
+  channel; non-positive CPU siblings do not invalidate it. GPU is optional.
+- Any discovered selected sensor input or fault read/parse failure, including a
+  CPU channel, enters sensor fail-safe; absence alone is not a fault.
+- Fail-safe is a control state, not a fabricated temperature. Fail-safe and
+  configured full speed bypass smoothing.
+- All discovered fans share global safety decisions; one invalid policy or
+  incomplete fan does not permit another fan to remain on an untrusted curve,
+  and a complete fan does not mask it.
+- Known maxima and writable controls are required for recoverable safe control;
+  every discovered fan must be complete, and inability to command maximum is
+  fatal.
+- `/run/t2fand.pid` is daemon-owned. The PID existence check is not identity
+  authentication or atomic locking.
+- No secrets, network listener, encryption, direct syslog API, Python logging
+  framework, persistent sysfs handle, or remote source claim is introduced.
+- Cleanup cannot guarantee fan state after abrupt power/kernel/interpreter or
+  hardware failure.
+- OpenRC is sole service integration; package payload is exactly two files.
 
 ## Observability
 
-| Signal/evidence                      | Meaning                                   | Status                                        |
-| ------------------------------------ | ----------------------------------------- | --------------------------------------------- |
-| `T2 Fan Daemon must be run as root`  | Non-root startup rejection                | documented daemon behavior; execution unknown |
-| `Fan not found` / CPU diagnostic     | Startup sensor/path failure               | documented daemon behavior; execution unknown |
-| `T2 Fan Daemon is already running`   | Existing `/proc/<pid>` for PID-file value | documented; not an authenticated health check |
-| `T2 Fan Daemon is shutting down...`  | Handled cleanup began                     | documented; cleanup outcome unknown           |
-| `/run/t2fand.pid`                    | Daemon liveness hint                      | daemon-owned; not health/auth evidence        |
-| OpenRC service status                | Supervised-state status                   | current static interface; runtime unknown     |
-| OpenRC respawn                       | Recovery attempt after any child exit     | current static policy; runtime unknown        |
-| OpenRC explicit stop                 | Stop path with no respawn                 | current static policy; runtime unknown        |
-| Package payload/path/mode inspection | Static packaging evidence                 | required acceptance; not run                  |
+Default output is flushed and contains startup/shutdown summaries, warnings,
+errors, topology/state transitions, exact config problems, mode, and failure
+reasons. Verbose output adds one record each second with all sensor labels and
+values/unknown states, `gpu_temps=missing`, hottest value, smoothing/recovery
+state, mode/reason, and per-fan `target_rpm` versus `actual_rpm`. Logger routing
+is service-level transport only. No metrics, tracing, health endpoint, or audit
+store is defined.
 
-No structured logs, metrics, tracing, health endpoint, alerting, or audit record
-is defined. Service stdout capture is environment-dependent and `unknown`.
+## Compatibility and dependencies
 
-## Compatibility and packaging
-
-- Package contract: Arch `x86_64`, name `t2fand`, current version `1.2.0`, and
-  `pkgrel=2` after the requested bump; GPL3.
-- Existing declared dependencies remain `linux-t2` and `python`, with `git` as
-  the existing build dependency. An Arch OpenRC runtime dependency is `unknown`
-  and must not be guessed or added from this contract.
-- Static payload contract is exactly `/usr/bin/t2fand` mode 0700 and
-  `/etc/init.d/t2fand` mode 0755.
-- Compatibility requires Python 3, Linux sysfs, root, and OpenRC. Exact Python,
-  kernel, `linux-t2`, OpenRC, Mac-model, and distribution matrices are
-  `unknown`.
-- The unpinned remote Git source and `sha256sums=('SKIP')` remain; provenance,
-  reproducibility, and local/package source equivalence are `unknown`.
-- No migration, rollback, backup, upgrade-safety, or fail-safe procedure is
-  defined; existence and outcomes are `unknown`.
+Compatibility requires Python 3, Linux hwmon/sysfs, root, and OpenRC. Arch
+target remains `x86_64`; package identity is `t2fand`, GPL3, release `2.0.0-1`
+(`pkgver=2.0.0`, `pkgrel=1`). Runtime dependencies are `linux-t2`, `python`,
+and `util-linux`; `git` remains a build dependency. No specific syslog daemon
+is required. The unpinned remote Git source and skipped checksum remain
+existing provenance risks and are not changed here.
 
 ## Validation and acceptance
 
-No product, service, hardware, package-build, staged-install, or CI check was
-run for this contract revision. Current static implementation truth is limited
-to the inspected source files; do not claim runtime, package, or staged results.
+No test execution, hardware access, root execution, OpenRC lifecycle,
+staged-install, package build, or syslog delivery is claimed here. Current
+checked-in evidence is the daemon source, OpenRC definition, Makefile, PKGBUILD,
+and fake-sysfs unittest definitions. It establishes source/static definitions
+and test-definition presence only; it does not establish runtime behavior or any
+hardware, service, package, staging, or syslog outcome. The `make test` outcome
+remains unverified because it was not run.
 
-### Current static acceptance
+Runtime and integration acceptance remains required:
 
-Delivered-source inspection covers:
+1. `make test` using standard-library unittest fake sysfs/config/run trees and
+   mocks, covering global hwmon, CPU/GPU/Wi-Fi/storage/arbitrary channels,
+   numeric DRM versus connectors, alias deduplication, one read per cycle,
+   hottest selection, GPU-missing/recovery transitions, mixed CPU channels with
+   a positive and non-positive sibling, all sensor/CPU/fault/parse failures
+   including a positive CPU plus another failed channel, immediate maximum,
+   five-cycle recovery and history reset, one-second/five-sample smoothing, all
+   curves, every config defect, valid configured-full distinction, no fan,
+   unreadable/incomplete/invalid-limit fan, complete-plus-incomplete fan-set
+   rejection, manual-enable failure, maximum-write failure, fatal maximum
+   attempts for every discovered fan, independent cleanup, both signals,
+   malformed/stale PID, verbose fields, RPM naming, and default error rate
+   limiting.
+2. Static checks for import safety, exact modes/paths, unconditional OpenRC
+   install, intentional package release `2.0.0-1`, exact two-file package
+   payload, `util-linux`, configurable args, logger directives,
+   local-filesystem/soft-logger dependencies, PID-path separation,
+   bounded/backed-off directives, and absence of alternate init
+   artifacts/selectors/payloads.
+3. Documentation review proving README onboarding is concise while retaining
+   operator-action, safety, configuration, OpenRC, observability, and testing
+   pointers; `SPEC.md` and `CONTEXT.md` retain exhaustive contract and
+   implementation detail. Package descriptions, install instructions, and
+   service comments must not contradict that ownership or the safety contract.
+4. Complete diff review for unrelated edits, stale CPU/card0-only claims,
+   secrets, shell portability, modes, and readability.
 
-1. `t2fand.initd` source identity and unchanged established directives,
-   including foreground `supervise-daemon`, no `pidfile`, no background or
-   daemonization setting, and no network dependency.
-2. `t2fand.service` absence and absence of any systemd install/package path.
-3. Makefile absence of `INIT_SYSTEM`, systemd variables, `PREFIX`, and marker
-   detection; unconditional `DESTDIR`/`BINDIR`/`OPENRC_INITDDIR` paths, exact
-   source payload, and modes 0700/0755; no service actions.
-4. PKGBUILD name `t2fand`, incremented `pkgrel`, exactly two install payloads,
-   no systemd directory/unit, and no claimed OpenRC runtime dependency.
-5. Source-level daemon PID ownership and OpenRC separation of supervisor state.
-6. Exact respawn policy: all exits including 0, unlimited count, constant two
-   seconds, and explicit-stop/no-respawn contract.
-
-These are static acceptance requirements only. Safe staged inspection may use
-`DESTDIR`; no host or service state may be changed. Staged, package, runtime,
-and hardware results remain unknown.
-
-### Retired and pending validation
-
-The historical dry-run Makefile parse checks for `INIT_SYSTEM=systemd`,
-`openrc`, and `auto` are superseded and are not current OpenRC-only validation.
-They did not execute selector branches, invalid-selector handling, `sh -n`,
-DESTDIR staging, package build, OpenRC syntax checks, lifecycle checks, or
-hardware checks. No result from them proves this target.
-
-Runtime acceptance is pending and must not be performed in this task. If later
-authorized, it must separately cover OpenRC start, stop, restart, status,
-status-0 and unexpected exits, unlimited respawn, constant two-second delay,
-explicit-stop suppression, SIGTERM cleanup, daemon PID ownership, and hardware
-boundaries. No verified test command, test suite, fixture, build result, package
-artifact, or compatibility matrix exists locally.
-
-`dprint.json` has no ordinary-Markdown association for `SPEC.md`; a formatter
-run is not product validation.
+Checked-in source and test definitions must be labeled separately from
+unavailable hardware, OpenRC, syslog, package, and service-runtime evidence. No
+README example, source inspection, test-definition presence, or formatter run
+proves runtime behavior. `dprint fmt --no-gitignore SPEC.md` is formatting only;
+this file is not associated with ordinary Markdown by the current `dprint.json`.
 
 ## Decisions
 
@@ -374,56 +393,84 @@ run is not product validation.
   behavioral authority; OpenRC was the closest equivalent.
 - `DEC-002` (retained): the daemon stays foreground and owns `/run/t2fand.pid`;
   supervisor state is separate and OpenRC `pidfile` is forbidden.
-- `DEC-003` (retained and narrowed to OpenRC): use `supervise-daemon`, unlimited
-  all-exit respawn, constant two-second delay, `retry="SIGTERM/5"`, and no
-  background variables; explicit stop does not respawn.
+- `DEC-003` (**narrowed by `DEC-012`):** use `supervise-daemon`, all-exit
+  respawn, a two-second delay, `retry="SIGTERM/5"`, and no background variables;
+  explicit stop does not respawn. Unlimited respawn is superseded.
 - `DEC-004` (**superseded by `DEC-008`):** `INIT_SYSTEM=auto` was the default
-  and failed closed on ambiguous runtime markers.
+  and failed closed on ambiguous markers.
 - `DEC-005` (**superseded by `DEC-009`):** package name was `t2fand-openrc` and
   both service definitions shipped.
-- `DEC-006` (**superseded by `DEC-010`):** the prior reconciliation treated
+- `DEC-006` (**superseded by `DEC-010`):** prior reconciliation treated the
   static OpenRC implementation as present and made no staged/package/runtime
-  claim; its synchronization claim remains historical evidence only.
-- `DEC-007` (current static implementation): OpenRC is the sole supported
-  service manager; the retained `t2fand.initd` is the sole service definition
-  and payload. The delivered source has no systemd unit.
-- `DEC-008` (current static implementation): Makefile installation is
-  unconditional OpenRC staging through `DESTDIR`, `BINDIR`, and
-  `OPENRC_INITDDIR`, with no service actions.
-- `DEC-009` (current static implementation): retain package name `t2fand`, set
-  `pkgrel` to 2, and ship exactly the executable and OpenRC init script; do not
-  guess an Arch OpenRC dependency.
-- `DEC-010`: this is a current static implementation contract. The recorder owns
-  later `CONTEXT.md` synchronization; no package, staged-install, or runtime
-  outcome is claimed now.
+  claim; its synchronization claim remains historical evidence.
+- `DEC-007` (retained): OpenRC is the sole supported service manager; retained
+  `t2fand.initd` is the sole service definition and payload; no systemd unit.
+- `DEC-008` (retained): Make installation is unconditional OpenRC staging
+  through `DESTDIR`, `BINDIR`, and `OPENRC_INITDDIR`, with no service actions.
+- `DEC-009` (**narrowed by `DEC-013`):** retain package name `t2fand` and exact
+  daemon/init payload; do not guess an OpenRC or syslog daemon dependency.
+- `DEC-010` (retained): prior contract was static implementation truth; the
+  recorder owns later `CONTEXT.md` synchronization and no runtime outcome was
+  claimed.
+- `DEC-011` (retained; checked-in source and fake-sysfs test definitions): every
+  hwmon source participates in hottest-temperature selection; CPU is mandatory,
+  GPU loss is an explicit recoverable topology state, and failure is represented
+  as control mode rather than a sentinel.
+- `DEC-012` (retained; checked-in init definition; OpenRC runtime unknown):
+  bound OpenRC crash recovery at five respawns per 60 seconds, base delay two
+  seconds, and two-second incremental backoff; retain foreground operation,
+  daemon PID ownership, and explicit-stop suppression.
+- `DEC-013` (retained; checked-in init/package definitions; logger delivery
+  unknown): route streams through util-linux `/usr/bin/logger`, make
+  `t2fand_args` configurable through `/etc/conf.d/t2fand`, and add the direct
+  `util-linux` package dependency without selecting a syslog daemon.
+- `DEC-014` (retained; checked-in source and fake-sysfs test definitions): CPU
+  safety is channel-set based. One usable positive selected CPU channel is
+  sufficient; non-positive siblings do not invalidate it, but any discovered
+  sensor input or fault read/parse failure remains an immediate sensor
+  fail-safe.
+- `DEC-015` (settled; checked-in source and partial targeted fan test coverage;
+  test execution unknown): fan safety is candidate-set based. Every discovered,
+  deduplicated fan must have usable limits and control authority; one complete
+  fan does not mask an incomplete candidate. Fatal handling attempts known
+  maximums independently for all discovered fans before independent
+  manual-mode and PID cleanup.
 
 ## Cumulative change history
 
-| ID      | State/change                                                                                                                                                                         | Rationale and transition                                                                                                                         |
-| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `H-001` | **Superseded historical baseline:** systemd was the only checked-in service integration; OpenRC metadata was contradictory and unsupported.                                          | Preserved as historical local evidence.                                                                                                          |
-| `H-002` | **Superseded pre-implementation transition:** the 2026-08-27 reconciliation added an OpenRC contract, Makefile selection/staging, and both package service definitions.              | Preserved as the prior contract transition; it superseded only the older install/package requirements at that time.                              |
-| `H-003` | **Superseded dual-init implementation state:** the checked-in `t2fand.initd`, selector Makefile, systemd unit, and both-definition PKGBUILD were present; systemd was authoritative. | Source inspection did not prove staged installation, package artifacts, OpenRC syntax/lifecycle, hardware, or runtime success.                   |
-| `H-004` | **Current static implementation:** OpenRC-only support, retained unchanged `t2fand.initd`, unconditional OpenRC install, and exact two-file package payload.                         | Delivered source supersedes the dual-init/systemd-authoritative state; package, staged-install, runtime, and hardware validation remain unknown. |
+| ID      | State/change                                                                                                                                                                                                                                                                      | Rationale and transition                                                                                                                                                                                          |
+| ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `H-001` | Superseded historical baseline: systemd was the only checked-in service integration; OpenRC metadata was contradictory and unsupported.                                                                                                                                           | Preserved historical local evidence.                                                                                                                                                                              |
+| `H-002` | Superseded pre-implementation transition: 2026-08-27 reconciliation added OpenRC contract, Makefile selection/staging, and both package service definitions.                                                                                                                      | Preserved prior contract transition.                                                                                                                                                                              |
+| `H-003` | Superseded dual-init implementation state: init script, selector Makefile, systemd unit, and both-definition package were present; systemd was authoritative.                                                                                                                     | Static inspection did not prove staged/package/OpenRC/hardware/runtime success.                                                                                                                                   |
+| `H-004` | Superseded/current baseline: OpenRC-only support, retained init script, unconditional OpenRC install, and exact two-file payload.                                                                                                                                                 | This revision preserves the direction and adds the global fail-safe contract before implementation.                                                                                                               |
+| `H-005` | Proposed pre-implementation transition: global hwmon hottest-source control, CPU-required safety, explicit modes, config fail-safe, cleanup hardening, verbose telemetry, fake tests, logger routing, configurable arguments, util-linux, and bounded OpenRC recovery.            | User-authorized revision; no shipped behavior or runtime result is claimed.                                                                                                                                       |
+| `H-006` | Current checked-in implementation transition: daemon `main(argv=None)`, verbose output, signal-request cleanup, global thermal fail-safe source, OpenRC configurable arguments/logger/bounded recovery, util-linux package metadata, and fake-sysfs test definitions are present. | Source, service, package, and test definitions are evidence of checked-in content only; no runtime, hardware, service, package, staging, or syslog result is claimed.                                             |
+| `H-007` | Current checked-in CPU-channel reconciliation: one usable positive selected CPU channel satisfies CPU availability; non-positive CPU siblings do not invalidate it, while any discovered sensor input or fault read/parse failure remains fail-safe.                              | Corrects the stricter non-positive-CPU statement retained as superseded `REQ-033`; source and test definitions are evidence only, with no runtime result claimed.                                                 |
+| `H-008` | Contract reconciliation: fan control requires every discovered, resolved-path-deduplicated candidate to be complete and controllable; at least one complete fan is not sufficient when another candidate is incomplete.                                                           | Resolves the `REQ-038`/checked-in `discover_fans` mismatch with the smallest safety-preserving global rule; source enforcement and partial targeted fan coverage are present, exhaustive execution remains unverified. |
+| `H-009` | Evidence correction: the `DEC-015` and `H-008` fan-coverage notes now record partial targeted coverage for incomplete fan sets and fatal cleanup attempts.                                                                                                                                        | Corrects stale “targeted test coverage is not present” wording without claiming test execution or complete coverage.                                                                                                  |
+| `H-010` | Release/install reconciliation: the prior contract identified package release `1.2.0-3`; the current checked-in package metadata identifies intentional release `2.0.0-1`.                                                                                                                    | `PKGBUILD` verifies `pkgver=2.0.0` and `pkgrel=1`; the exact two-file OpenRC payload and `util-linux` dependency remain required.                                                                                       |
+| `H-011` | Documentation ownership reconciliation: README is concise operator onboarding; exhaustive contract and implementation/design detail remain in `SPEC.md` and `CONTEXT.md`.                                                                                                                | Preserves the safety/product requirements while changing only detail placement; no shipped documentation or runtime outcome is claimed.                                                                                |
 
-## Open questions
+## Open questions and unknowns
 
-| ID      | Question                                                                                                                | Resolution/status                                                                                                                  |
-| ------- | ----------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `Q-001` | Which T2 Mac models, kernels, and distributions are supported?                                                          | unknown                                                                                                                            |
-| `Q-002` | Is the GPU availability check intended to glob DRM hwmon paths rather than call `Path.exists()` on a literal wildcard?  | unknown                                                                                                                            |
-| `Q-003` | Is OpenRC support intended, and where is its definition and validation?                                                 | Superseded question: OpenRC-only support is implemented in source; package, staged-install, and runtime validation remain unknown. |
-| `Q-004` | Which exact remote Git revision and checksum should PKGBUILD use?                                                       | unknown; out of scope                                                                                                              |
-| `Q-005` | What numeric ranges and threshold relationships are valid?                                                              | unknown; daemon scope unchanged                                                                                                    |
-| `Q-006` | What fail-safe action is required after SIGKILL, crash, I/O failure, or power loss?                                     | unknown; daemon scope unchanged                                                                                                    |
-| `Q-007` | Should configuration reload without restart be supported?                                                               | unknown                                                                                                                            |
-| `Q-008` | What authorized test command, hardware fixture, and acceptance thresholds validate runtime and package behavior?        | No verified local test command exists.                                                                                             |
-| `Q-009` | Should releases include only package files while the workflow also lists `*.zip`?                                       | unknown; existing workflow scope unchanged                                                                                         |
-| `Q-010` | Should the retired systemd unit or target be restored?                                                                  | No; systemd is out of scope under `DEC-007`.                                                                                       |
-| `Q-011` | Is `github.event.head_commit.message` populated for pull-request events?                                                | unknown; existing workflow scope unchanged                                                                                         |
-| `Q-012` | Does any workflow or remote release behavior create a Git tag after the local `Create Tag` step?                        | unknown; remote behavior out of scope                                                                                              |
-| `Q-013` | Which active runtime markers should the old `INIT_SYSTEM=auto` selector use?                                            | Superseded by unconditional OpenRC installation.                                                                                   |
-| `Q-014` | Which OpenRC dependency declarations are justified by local filesystem, `/run`, sysfs, or hardware readiness?           | unknown; no network dependency permitted.                                                                                          |
-| `Q-015` | Do OpenRC lifecycle, explicit-stop, unlimited-respawn, and exact-delay behaviors match the contract on supported hosts? | unknown; runtime validation pending and out of scope for this task.                                                                |
-| `Q-016` | What Arch package dependency provides OpenRC at runtime?                                                                | unknown; no local authoritative evidence; do not add or claim one.                                                                 |
-| `Q-017` | Does this implementation preserve the exact two-file package payload and requested `pkgrel` bump?                       | Delivered PKGBUILD statically shows the exact two-file payload and `pkgrel=2`; package build remains unknown.                      |
+| ID      | Question/status                                                                                                                                                                                       |
+| ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Q-001` | Exact T2 Mac models, kernels, and distributions supported: unknown.                                                                                                                                   |
+| `Q-002` | Whether current hardware exposes all contracted hwmon/DRM paths: unknown; fake fixtures are required.                                                                                                 |
+| `Q-003` | OpenRC support and definition location: OpenRC-only direction and the checked-in `t2fand.initd` definition are settled; directives/runtime remain unverified.                                         |
+| `Q-004` | Exact remote Git revision/checksum: unknown; out of scope.                                                                                                                                            |
+| `Q-005` | Valid numeric threshold ranges beyond finite `low_temp < high_temp`: unknown; no universal temperature range is invented.                                                                             |
+| `Q-006` | Abrupt-failure hardware state: cleanup is best effort and outcome remains unknown.                                                                                                                    |
+| `Q-007` | Live configuration reload: not supported; restart is required.                                                                                                                                        |
+| `Q-008` | Authorized runtime fixture/hardware thresholds: no execution in this task; later project-native evidence required.                                                                                    |
+| `Q-009` | Existing workflow release `*.zip` behavior: unknown; unrelated workflow remains unchanged.                                                                                                            |
+| `Q-010` | Restore systemd: no; prohibited by OpenRC-only contract.                                                                                                                                              |
+| `Q-011` | Pull-request `head_commit.message` behavior: unknown; existing workflow unchanged.                                                                                                                    |
+| `Q-012` | Remote tag/release behavior: unknown and out of scope.                                                                                                                                                |
+| `Q-013` | Old selector markers: superseded by unconditional OpenRC installation.                                                                                                                                |
+| `Q-014` | OpenRC version support for local filesystem, soft logger, bounded respawn, and backoff directives: definitions are checked in; version/runtime support remains unknown and must not silently degrade. |
+| `Q-015` | OpenRC lifecycle, explicit stop, bounded respawn, delay, and logger delivery on supported hosts: unknown.                                                                                             |
+| `Q-016` | Arch OpenRC runtime provider: no hard OpenRC dependency is guessed; `util-linux` is explicitly required for logger.                                                                                   |
+| `Q-017` | Exact package/staged result after the revised dependency and metadata: unknown until later checks.                                                                                                    |
+| `Q-018` | Hardware cleanup after power loss, SIGKILL, kernel panic, native abort, or failed sysfs write: inherently not guaranteed; runtime result unknown.                                                     |
