@@ -192,7 +192,7 @@ def _read_integer(path: Path) -> int:
 
 
 def _fan_candidates(sysfs_root: Path) -> list[Path]:
-    """Find fan input files in the T2 and ordinary hwmon layouts."""
+    """Find fan input files in the T2 layout."""
 
     candidates: list[Path] = []
     t2_matches = sorted(
@@ -203,7 +203,6 @@ def _fan_candidates(sysfs_root: Path) -> list[Path]:
             candidates.extend(match.glob("fan*_input"))
         elif match.name.startswith("fan") and match.name.endswith("_input"):
             candidates.append(match)
-    candidates.extend((sysfs_root / "class/hwmon").glob("hwmon*/fan*_input"))
     return sorted(candidates, key=str)
 
 
@@ -242,6 +241,24 @@ def _drm_card(path: Path) -> Optional[str]:
     for part in path.parts:
         if re.fullmatch(r"card\d+", part):
             return part
+    return None
+
+
+def _off_dgpu_pci(sysfs_root: Path) -> Optional[str]:
+    switch_path = sysfs_root / "kernel/debug/vgaswitcheroo/switch"
+    try:
+        lines = switch_path.read_text().splitlines()
+    except (OSError, UnicodeError):
+        return None
+
+    for line in lines:
+        match = re.match(
+            r"^\d+:DIS:[^:]*:Off:(\d{4}:\d{2}:\d{2}\.\d+)$",
+            line,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1)
     return None
 
 
@@ -343,8 +360,12 @@ def discover_sensors(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> SensorSnapshot:
     valid_values: list[float] = []
     cpu_valid = False
     gpu_present = any(candidate.is_gpu for candidate in candidates)
+    off_dgpu_pci = _off_dgpu_pci(sysfs_root)
 
     for candidate in candidates:
+        if off_dgpu_pci is not None and off_dgpu_pci in candidate.path.parts:
+            continue
+
         label = _sensor_label(candidate)
         try:
             raw_value = candidate.path.read_text().strip()
