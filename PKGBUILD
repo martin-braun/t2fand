@@ -1,5 +1,6 @@
 # Maintainer: Martin Braun <martin-braun@w9mail.com>
 pkgname=t2fand
+pkgver=2.0.1
 pkgrel=1
 pkgdesc="Python daemon for T2 Mac fan control with OpenRC service definition"
 arch=('x86_64')
