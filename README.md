@@ -28,6 +28,18 @@ sudo make install
 #
 ```
 
+Or as package under Artix Linux (OpenRC):
+
+```sh
+#
+
+makepkg -si
+sudo rc-update add t2fand default
+sudo rc-service t2fand start
+
+#
+```
+
 This installs `/usr/bin/t2fand` with mode `0700` and `/etc/init.d/t2fand` with
 mode `0755`. Installation does not enable or start the service. For staging,
 `DESTDIR` prefixes both paths; `BINDIR` defaults to `/usr/bin` and
@@ -50,6 +62,12 @@ always_full_speed = false
 `exponential`, or `logarithmic`; `always_full_speed` can be `true` or `false`.
 Configuration is read at startup. Restart after changes. Invalid configuration
 selects fail-high maximum control when available.
+
+Here's an image to better explain this:
+
+![Image of fan curve graphs](https://user-images.githubusercontent.com/39993457/233580720-cfdaba12-a2d8-430c-87a2-15209dcfec6d.png)
+
+> (Red: linear, blue: exponential, green: logarithmic)
 
 ## Run with OpenRC
 
@@ -101,4 +119,4 @@ implementation truth and history.
 
 ## Use of AI
 
-Version 2.0.0 was built by agents on the basis of version 1.2.0.
+This version was built by agents on the basis of version 1.2.0.
