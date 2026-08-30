@@ -3,6 +3,7 @@
 
 .agents
 .opencode
+opencode.json
 CONTEXT.md
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
