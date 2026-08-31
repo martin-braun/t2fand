@@ -2,7 +2,6 @@
 
 description="A simple daemon to control fan speed on Macs with T2 chip"
 command=/usr/bin/t2fand
-# Read optional daemon arguments from /etc/conf.d/t2fand.
 command_args="${t2fand_args:-}"
 supervisor="supervise-daemon"
 # Keep the daemon foregrounded; its PID file is separate from supervisor state.
@@ -19,8 +18,8 @@ retry="SIGTERM/5"
 output_logger="/usr/bin/logger -t t2fand -p daemon.info"
 error_logger="/usr/bin/logger -t t2fand -p daemon.err"
 
+# Require local filesystems; logger remains an optional dependency.
 depend() {
-	# Require local filesystems; logger remains an optional dependency.
 	need localmount
 	use logger
 }

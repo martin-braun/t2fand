@@ -2,9 +2,12 @@ import ast
 import contextlib
 import importlib.util
 import io
+import locale
 import re
+import shlex
 import sys
 import tempfile
+import types
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -17,6 +20,17 @@ SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 LOADER.exec_module(MODULE)
+
+BENCHMARK_SOURCE = SOURCE.parent / "t2fanbench.py"
+BENCHMARK_LOADER = SourceFileLoader(
+    "t2fanbench_test_subject", str(BENCHMARK_SOURCE)
+)
+BENCHMARK_SPEC = importlib.util.spec_from_loader(
+    BENCHMARK_LOADER.name, BENCHMARK_LOADER
+)
+BENCHMARK = importlib.util.module_from_spec(BENCHMARK_SPEC)
+sys.modules[BENCHMARK_SPEC.name] = BENCHMARK
+BENCHMARK_LOADER.exec_module(BENCHMARK)
 
 
 class FakeSysfs(unittest.TestCase):
@@ -36,8 +50,8 @@ class FakeSysfs(unittest.TestCase):
         self.root = Path(self.tempdir.name)
         self.hwmon = self.root / "class/hwmon"
         self.hwmon.mkdir(parents=True)
-        self.fan_dir = self.hwmon / "hwmon-fan"
-        self.fan_dir.mkdir()
+        self.fan_dir = self.root / "devices/a/b/c/d/APP0001:00"
+        self.fan_dir.mkdir(parents=True)
         self._write(self.fan_dir / "fan1_min", "100")
         self._write(self.fan_dir / "fan1_max", "1000")
         self._write(self.fan_dir / "fan1_input", "400")
@@ -105,7 +119,7 @@ class FakeSysfs(unittest.TestCase):
 
     def add_t2_fan(self, name="fan2"):
         app = self.root / "devices/a/b/c/d/APP0001:00"
-        app.mkdir(parents=True)
+        app.mkdir(parents=True, exist_ok=True)
         self._write(app / f"{name}_min", "200")
         self._write(app / f"{name}_max", "1200")
         self._write(app / f"{name}_input", "500")
@@ -305,7 +319,7 @@ class SafetyTests(FakeSysfs):
         self.fan_object = self.fan()
         self.config_result = self.config()
 
-    def cycle(self, now=0):
+    def cycle(self, now=0, settings=None):
         with self.capture_output():
             return MODULE.run_cycle(
                 [self.fan_object],
@@ -313,6 +327,7 @@ class SafetyTests(FakeSysfs):
                 self.state,
                 self.root,
                 now=now,
+                settings=settings,
             )
 
     def test_cpu_missing_nonpositive_and_malformed_fail_high_immediately(self):
@@ -382,6 +397,44 @@ class SafetyTests(FakeSysfs):
         self.assertEqual([70.0] * 5, self.state.history)
         report = self.cycle(6)
         self.assertEqual(70.0, report.rolling_mean)
+
+    def test_runtime_overrides_change_recovery_sample_and_reminder_behavior(
+        self,
+    ):
+        settings = MODULE.RuntimeSettings(2, 2, 1.5)
+        self.state = MODULE.ControllerState()
+        self.set_cpu("bad")
+        self.cycle(0, settings=settings)
+
+        for now, cpu_value in ((1, "70000"), (2, "60000"), (3, "50000")):
+            self.set_cpu(cpu_value)
+            for sensor in (self.wifi, self.storage, self.root / "gpu-hwmon"):
+                self._write(sensor / "temp1_input", "40000")
+            report = self.cycle(now, settings=settings)
+
+        self.assertFalse(self.state.recovery_active)
+        self.assertEqual(2, self.state.recovery_cycles)
+        self.assertEqual([60.0, 50.0], self.state.history)
+        self.assertEqual(55.0, report.rolling_mean)
+        self.assertEqual(2, self.state.sensor_recovery_cycles)
+        self.assertEqual(2, self.state.sample_limit)
+
+        reminder_state = MODULE.ControllerState()
+        self.set_cpu("bad")
+        with self.capture_output() as (stdout, stderr):
+            for now in (0, 0.5, 1.5):
+                MODULE.run_cycle(
+                    [self.fan_object],
+                    self.config_result,
+                    reminder_state,
+                    self.root,
+                    now=now,
+                    settings=settings,
+                )
+        self.assertEqual(
+            1, stdout.getvalue().count("warning: mode=sensor-failsafe")
+        )
+        self.assertEqual("", stderr.getvalue())
 
     def test_interrupted_sensor_recovery_restarts_at_zero(self):
         self.state = MODULE.ControllerState(history=[99.0])
@@ -537,7 +590,7 @@ class CurveAndConfigTests(FakeSysfs):
             with self.subTest(expected=expected):
                 self.assert_config_defect(contents, expected)
 
-    def test_unreadable_config_enters_global_failsafe(self):
+    def test_unreadable_config_is_startup_error(self):
         path = self.root / "config"
         path.mkdir()
         result = MODULE.load_configuration(path, 1)
@@ -547,15 +600,12 @@ class CurveAndConfigTests(FakeSysfs):
             result.errors[0].startswith(f"{path}: cannot read config: ")
         )
 
-        state = MODULE.ControllerState()
-        with self.capture_output():
-            report = MODULE.run_cycle(
-                [self.fan()], result, state, self.root, now=0
+        with self.assertRaises(MODULE.StartupError):
+            MODULE.run_cycle(
+                [self.fan()], result, MODULE.ControllerState(), self.root, now=0
             )
-        self.assertEqual("config-failsafe", state.mode)
-        self.assertEqual((1000,), report.targets)
 
-    def test_config_generation_io_failure_enters_global_failsafe(self):
+    def test_config_generation_io_failure_is_startup_error(self):
         self.add_t2_fan()
         fans, errors = MODULE.discover_fans(self.root)
         self.assertEqual([], errors)
@@ -568,21 +618,12 @@ class CurveAndConfigTests(FakeSysfs):
 
         self.assertFalse(result.valid)
         self.assertEqual([diagnostic], result.errors)
-        state = MODULE.ControllerState()
-        with self.capture_output():
-            report = MODULE.run_cycle(fans, result, state, self.root, now=0)
-        self.assertEqual("config-failsafe", state.mode)
-        self.assertEqual(diagnostic, state.reason)
-        self.assertEqual(tuple(fan.maximum for fan in fans), report.targets)
-        self.assertEqual(
-            [str(fan.maximum) for fan in fans],
-            [
-                fan.base_path.with_name(f"{fan.name}_output").read_text()
-                for fan in fans
-            ],
-        )
+        with self.assertRaises(MODULE.StartupError):
+            MODULE.run_cycle(
+                fans, result, MODULE.ControllerState(), self.root, now=0
+            )
 
-    def test_malformed_ini_enters_global_failsafe(self):
+    def test_malformed_ini_is_startup_error(self):
         self.add_t2_fan()
         fans, errors = MODULE.discover_fans(self.root)
         self.assertEqual([], errors)
@@ -596,18 +637,10 @@ class CurveAndConfigTests(FakeSysfs):
             result.errors[0].startswith(f"{path}: cannot read config: ")
         )
 
-        state = MODULE.ControllerState()
-        with self.capture_output():
-            report = MODULE.run_cycle(fans, result, state, self.root, now=0)
-        self.assertEqual("config-failsafe", state.mode)
-        self.assertEqual(tuple(fan.maximum for fan in fans), report.targets)
-        self.assertEqual(
-            [str(fan.maximum) for fan in fans],
-            [
-                fan.base_path.with_name(f"{fan.name}_output").read_text()
-                for fan in fans
-            ],
-        )
+        with self.assertRaises(MODULE.StartupError):
+            MODULE.run_cycle(
+                fans, result, MODULE.ControllerState(), self.root, now=0
+            )
 
     def test_runtime_calculation_failure_persists_config_failsafe(self):
         policy = MODULE.FanConfig(55, 56, "logarithmic", False)
@@ -652,6 +685,706 @@ class CurveAndConfigTests(FakeSysfs):
         self.assertEqual("configured-full", state.mode)
         self.assertEqual((1000,), report.targets)
         self.assertIsNone(report.rolling_mean)
+
+
+class ControlModeTests(FakeSysfs):
+    def smc_config(self, policy=None):
+        return MODULE.ConfigResult(
+            [policy], general=MODULE.GeneralConfig("smc")
+        )
+
+    def test_generated_config_selects_smc_and_general_is_first(self):
+        path = self.root / "etc/t2fand.conf"
+        path.parent.mkdir()
+        result = MODULE.load_configuration(path, 1)
+        self.assertEqual("smc", result.control_mode)
+        self.assertTrue(result.valid)
+        self.assertTrue(path.read_text().startswith("[General]\n"))
+        self.assertIn("control_mode = smc", path.read_text())
+        self.assertIn("[Fan1]", path.read_text())
+
+    def test_legacy_config_selects_t2fand_and_warns_without_rewrite(self):
+        path = self.root / "legacy.conf"
+        contents = (
+            "[Fan1]\nlow_temp=55\nhigh_temp=75\n"
+            "speed_curve=linear\nalways_full_speed=false\n"
+        )
+        path.write_text(contents)
+        result = MODULE.load_configuration(path, 1)
+        self.assertEqual("t2fand", result.control_mode)
+        self.assertEqual(
+            ["legacy configuration without [General]; using t2fand mode"],
+            result.warnings,
+        )
+        self.assertEqual(contents, path.read_text())
+
+    def test_explicit_smc_releases_verifies_and_never_writes_output(self):
+        fan = self.fan()
+        fan.base_path.with_name("fan1_manual").write_text("1")
+        fan.base_path.with_name("fan1_output").write_text("321")
+        MODULE.release_smc_ownership([fan])
+        self.assertEqual(
+            "0", fan.base_path.with_name("fan1_manual").read_text()
+        )
+        report = self.cycle_smc()
+        self.assertEqual((0,), report.manual)
+        self.assertEqual((321,), report.targets)
+        self.assertEqual(
+            "321", fan.base_path.with_name("fan1_output").read_text()
+        )
+
+    def test_smc_startup_releases_manual_before_running(self):
+        fan = self.fan()
+        fan.base_path.with_name("fan1_manual").write_text("1")
+        fan.base_path.with_name("fan1_output").write_text("321")
+        path = self.root / "config"
+        path.write_text(
+            "[General]\ncontrol_mode=smc\n[Fan1]\n"
+            "low_temp=bad\nhigh_temp=75\n"
+            "speed_curve=linear\nalways_full_speed=false\n"
+        )
+        pid_path = self.root / "run.pid"
+
+        def stop_loop(*args, **kwargs):
+            del args, kwargs
+
+        with mock.patch.object(
+            MODULE.os, "geteuid", return_value=0
+        ), mock.patch.object(
+            MODULE, "DEFAULT_PID_PATH", pid_path
+        ), mock.patch.object(
+            MODULE, "DEFAULT_CONFIG_PATH", path
+        ), mock.patch.object(MODULE, "prepare_pid"), mock.patch.object(
+            MODULE, "discover_fans", return_value=([fan], [])
+        ), mock.patch.object(
+            MODULE, "install_signal_handlers"
+        ), mock.patch.object(MODULE, "run_loop", side_effect=stop_loop):
+            with self.capture_output() as (stdout, stderr):
+                result = MODULE.main([])
+        self.assertEqual(0, result)
+        self.assertEqual(
+            "0", fan.base_path.with_name("fan1_manual").read_text()
+        )
+        self.assertEqual(
+            "321", fan.base_path.with_name("fan1_output").read_text()
+        )
+        self.assertIn(
+            "configuration warning: Fan1.low_temp is malformed",
+            stderr.getvalue(),
+        )
+        self.assertIn("stopped:", stdout.getvalue())
+
+    def cycle_smc(self, state=None, now=0):
+        state = state or MODULE.ControllerState()
+        with self.capture_output():
+            return MODULE.run_cycle(
+                [self.fan()], self.smc_config(), state, self.root, now=now
+            )
+
+    def test_smc_sensor_failure_degrades_without_takeover(self):
+        fan = self.fan()
+        fan.base_path.with_name("fan1_output").write_text("321")
+        self.set_cpu("bad")
+        state = MODULE.ControllerState()
+        report = self.cycle_smc(state)
+        self.assertEqual("smc", state.mode)
+        self.assertEqual("smc-degraded", state.control_status)
+        self.assertEqual((0,), report.manual)
+        self.assertEqual(
+            "321", fan.base_path.with_name("fan1_output").read_text()
+        )
+
+    def test_powered_dgpu_failure_degrades_smc_without_output_takeover(self):
+        fan = self.fan()
+        fan.base_path.with_name("fan1_output").write_text("321")
+        self._write(self.root / "gpu-hwmon/temp1_input", "bad")
+        state = MODULE.ControllerState()
+        report = self.cycle_smc(state)
+        self.assertEqual("smc-degraded", state.control_status)
+        self.assertIsNone(
+            next(
+                reading.value
+                for reading in report.snapshot.readings
+                if reading.is_gpu
+            ),
+        )
+        with self.capture_output() as (stdout, stderr):
+            MODULE.emit_verbose(report, [fan], self.smc_config(), state)
+        self.assertIn("amdgpu:edge=unknown", stdout.getvalue())
+        self.assertIn("sensor_status=degraded", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+        self.assertEqual(
+            "321", fan.base_path.with_name("fan1_output").read_text()
+        )
+
+    def test_smc_reports_observational_target_and_telemetry_without_verbose(
+        self,
+    ):
+        fan = self.fan()
+        fan.base_path.with_name("fan1_output").write_text("321")
+        state = MODULE.ControllerState()
+        sleeps = []
+
+        def sleeper(seconds):
+            sleeps.append(seconds)
+            state.shutdown_requested = True
+
+        with self.capture_output() as (stdout, stderr):
+            MODULE.run_loop(
+                [fan], self.smc_config(), state, self.root, sleeper=sleeper
+            )
+        text = stdout.getvalue()
+        self.assertEqual([1], sleeps)
+        self.assertIn(
+            "telemetry highest=nvme:Composite highest_temp=70.0", text
+        )
+        self.assertIn("fan1 actual_rpm=400", text)
+        self.assertNotIn("control_mode=smc", text)
+        self.assertEqual("", stderr.getvalue())
+
+    def test_smc_verbose_flag_emits_full_telemetry(self):
+        fan = self.fan()
+        fan.base_path.with_name("fan1_output").write_text("321")
+        state = MODULE.ControllerState()
+        verbose = MODULE._parser().parse_args(["-v"]).verbose
+
+        def sleeper(seconds):
+            del seconds
+            state.shutdown_requested = True
+
+        with self.capture_output() as (stdout, stderr):
+            MODULE.run_loop(
+                [fan],
+                self.smc_config(),
+                state,
+                self.root,
+                verbose=verbose,
+                sleeper=sleeper,
+            )
+
+        text = stdout.getvalue()
+        self.assertIn("control_mode=smc", text)
+        self.assertIn("sensors=", text)
+        self.assertIn("fan1 manual=0 target_rpm=321 actual_rpm=400", text)
+        self.assertNotIn("low_temp=", text)
+        self.assertNotIn("rolling_mean=", text)
+        self.assertEqual("", stderr.getvalue())
+
+    def test_t2fand_default_output_is_compact_and_verbose_output_is_full(self):
+        fan = self.fan()
+        state = MODULE.ControllerState()
+        sleeps = []
+
+        def sleeper(seconds):
+            sleeps.append(seconds)
+            state.shutdown_requested = True
+
+        with self.capture_output() as (stdout, stderr):
+            MODULE.run_loop(
+                [fan], self.config(), state, self.root, sleeper=sleeper
+            )
+        compact = stdout.getvalue()
+        self.assertEqual([1], sleeps)
+        self.assertIn("highest=nvme:Composite highest_temp=70.0", compact)
+        self.assertIn("fan1 actual_rpm=400", compact)
+        self.assertNotIn("sensors=", compact)
+        self.assertEqual("", stderr.getvalue())
+
+        state = MODULE.ControllerState()
+        with self.capture_output() as (stdout, stderr):
+            MODULE.run_loop(
+                [fan],
+                self.config(),
+                state,
+                self.root,
+                verbose=True,
+                sleeper=lambda seconds: setattr(
+                    state, "shutdown_requested", True
+                ),
+            )
+        self.assertIn("sensors=", stdout.getvalue())
+        self.assertIn("highest=nvme:Composite", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+
+    def test_hottest_sensor_label_is_first_on_equal_valid_values(self):
+        for sensor in (
+            self.cpu,
+            self.wifi,
+            self.storage,
+            self.root / "gpu-hwmon",
+        ):
+            self._write(sensor / "temp1_input", "60000")
+        snapshot = MODULE.discover_sensors(self.root)
+        self.assertEqual("cpu:Package id 0", snapshot.highest_label)
+        self.assertEqual(60.0, snapshot.highest)
+
+    def test_no_valid_hottest_is_unknown_in_compact_telemetry(self):
+        for sensor in (
+            self.cpu,
+            self.wifi,
+            self.storage,
+            self.root / "gpu-hwmon",
+        ):
+            self._write(sensor / "temp1_input", "bad")
+        state = MODULE.ControllerState()
+        with self.capture_output() as (stdout, stderr):
+            report = MODULE.run_cycle(
+                [self.fan()], self.config(), state, self.root, now=0
+            )
+            MODULE.emit_compact(report, [self.fan()])
+        telemetry = next(
+            line
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("telemetry ")
+        )
+        self.assertEqual(
+            "telemetry highest=unknown highest_temp=unknown fan1 actual_rpm=400",
+            telemetry,
+        )
+        self.assertIsNone(report.snapshot.highest)
+        self.assertEqual("", stderr.getvalue())
+
+    def test_faulted_and_skipped_sensors_are_excluded_from_hottest(self):
+        self._write(self.storage / "temp1_input", "90000")
+        self._write(self.storage / "temp1_fault", "1")
+        gpu_link = self.drm / "hwmon-gpu"
+        gpu_link.unlink()
+        gpu = self.root / "pci/0000:01:00.0/gpu-hwmon"
+        gpu.mkdir(parents=True)
+        self._sensor(gpu, "amdgpu", 100000, "edge")
+        gpu_link.symlink_to(gpu, target_is_directory=True)
+        switch = self.root / "kernel/debug/vgaswitcheroo/switch"
+        switch.parent.mkdir(parents=True)
+        switch.write_text("1:DIS:0000:Off:0000:01:00.0\n")
+
+        state = MODULE.ControllerState()
+        with self.capture_output() as (stdout, stderr):
+            report = MODULE.run_cycle(
+                [self.fan()], self.config(), state, self.root, now=0
+            )
+            MODULE.emit_compact(report, [self.fan()])
+
+        self.assertEqual("cpu:Package id 0", report.snapshot.highest_label)
+        self.assertEqual(60.0, report.snapshot.highest)
+        self.assertTrue(
+            any(
+                reading.error
+                and "fault" in reading.error
+                and reading.value is None
+                for reading in report.snapshot.readings
+            )
+        )
+        self.assertTrue(
+            any(
+                reading.error == "dGPU powered off; skipped"
+                for reading in report.snapshot.readings
+            )
+        )
+        self.assertIn(
+            "telemetry highest=cpu:Package id 0 highest_temp=60.0",
+            stdout.getvalue(),
+        )
+        self.assertEqual("", stderr.getvalue())
+
+    def test_compact_output_reports_unknown_rpm(self):
+        fan = self.fan()
+        fan.base_path.with_name("fan1_input").write_text("bad")
+        state = MODULE.ControllerState()
+        with self.capture_output() as (stdout, stderr):
+            report = MODULE.run_cycle(
+                [fan], self.config(), state, self.root, now=0
+            )
+            MODULE.emit_compact(report, [fan])
+        self.assertIn(
+            "highest=nvme:Composite highest_temp=70.0", stdout.getvalue()
+        )
+        self.assertIn("fan1 actual_rpm=unknown", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+
+    def test_smc_healthy_state_stays_quiet_but_degraded_reminders_remain(self):
+        fan = self.fan()
+        state = MODULE.ControllerState()
+        with self.capture_output() as (stdout, stderr):
+            MODULE.run_cycle([fan], self.smc_config(), state, self.root, now=0)
+            self.assertEqual("smc-auto", state.control_status)
+            MODULE.run_cycle([fan], self.smc_config(), state, self.root, now=61)
+            self.assertEqual("smc-auto", state.control_status)
+
+            self.set_cpu("bad")
+            MODULE.run_cycle([fan], self.smc_config(), state, self.root, now=62)
+            MODULE.run_cycle(
+                [fan], self.smc_config(), state, self.root, now=122
+            )
+
+        self.assertEqual("smc-degraded", state.control_status)
+        self.assertEqual("", stderr.getvalue())
+        text = stdout.getvalue()
+        self.assertNotIn("warning: mode=smc reason=SMC monitoring", text)
+        self.assertEqual(1, text.count("warning: mode=smc"))
+
+    def test_smc_restores_unexpected_manual_takeover(self):
+        fan = self.fan()
+        fan.base_path.with_name("fan1_manual").write_text("1")
+        state = MODULE.ControllerState()
+        with self.capture_output() as (_, stderr):
+            MODULE.run_cycle([fan], self.smc_config(), state, self.root, now=0)
+        self.assertEqual(
+            "0", fan.base_path.with_name("fan1_manual").read_text()
+        )
+        self.assertIn("unexpected manual=1", stderr.getvalue())
+
+    def test_smc_recovers_from_unreadable_or_malformed_manual_read(self):
+        fan = self.fan()
+        manual = fan.base_path.with_name("fan1_manual")
+        output = fan.base_path.with_name("fan1_output")
+        for failure in (OSError("unreadable"), ValueError("malformed")):
+            with self.subTest(failure=type(failure).__name__):
+                manual.write_text("1")
+                output.write_text("321")
+                state = MODULE.ControllerState()
+                with mock.patch.object(
+                    fan, "read_manual", side_effect=[failure, 0]
+                ), self.capture_output() as (_, stderr):
+                    report = MODULE.run_cycle(
+                        [fan], self.smc_config(), state, self.root, now=0
+                    )
+                self.assertEqual("smc", state.mode)
+                self.assertEqual("smc-auto", state.control_status)
+                self.assertEqual((0,), report.manual)
+                self.assertEqual("0", manual.read_text())
+                self.assertEqual("321", output.read_text())
+                self.assertIn("restoring SMC ownership", stderr.getvalue())
+
+    def test_smc_failed_restore_escalates_maximum_and_control_error(self):
+        fan = self.fan()
+        manual = fan.base_path.with_name("fan1_manual")
+        manual.unlink()
+        manual.mkdir()
+        state = MODULE.ControllerState()
+        with self.assertRaises(MODULE.FatalControlError):
+            self.cycle_smc(state)
+        self.assertEqual("control-error", state.mode)
+        self.assertEqual(
+            "1000", fan.base_path.with_name("fan1_output").read_text()
+        )
+        self.assertNotEqual("smc-auto", state.control_status)
+
+    def test_dgpu_off_skips_matching_sensor_and_reports_state(self):
+        gpu_link = self.drm / "hwmon-gpu"
+        gpu_link.unlink()
+        gpu = self.root / "pci/0000:01:00.0/gpu-hwmon"
+        gpu.mkdir(parents=True)
+        self._sensor(gpu, "amdgpu", 65000, "edge")
+        gpu_link.symlink_to(gpu, target_is_directory=True)
+        igpu = self.root / "igpu-hwmon"
+        igpu.mkdir()
+        self._sensor(igpu, "i915", 50000, "Package")
+        igpu_link = self.root / "class/drm/card1/device/hwmon/hwmon-igpu"
+        igpu_link.parent.mkdir(parents=True)
+        igpu_link.symlink_to(igpu, target_is_directory=True)
+        switch = self.root / "kernel/debug/vgaswitcheroo/switch"
+        switch.parent.mkdir(parents=True)
+        switch.write_text("1:DIS:0000:On:0000:01:00.0\n")
+        state = MODULE.ControllerState()
+        with self.capture_output() as (stdout, stderr):
+            MODULE.run_cycle(
+                [self.fan()], self.smc_config(), state, self.root, now=0
+            )
+            switch.write_text("1:DIS:0000:Off:0000:01:00.0\n")
+            report = MODULE.run_cycle(
+                [self.fan()], self.smc_config(), state, self.root, now=1
+            )
+        snapshot = report.snapshot
+        gpu_reading = next(
+            reading
+            for reading in snapshot.readings
+            if reading.error == "dGPU powered off; skipped"
+        )
+        self.assertEqual("dGPU powered off; skipped", gpu_reading.error)
+        self.assertEqual("off", snapshot.dgpu_state)
+        self.assertTrue(snapshot.gpu_present)
+        self.assertTrue(
+            any(
+                reading.label == "i915:Package" and reading.value == 50.0
+                for reading in snapshot.readings
+            )
+        )
+        self.assertTrue(snapshot.valid)
+        self.assertTrue(state.gpu_present)
+        self.assertNotIn("gpu-missing", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+
+    def test_smc_tachometer_failure_degrades_without_takeover(self):
+        fan = self.fan()
+        output = fan.base_path.with_name("fan1_output")
+        output.write_text("321")
+        self._write(fan.base_path.with_name("fan1_input"), "bad")
+        state = MODULE.ControllerState()
+        report = self.cycle_smc(state)
+        self.assertEqual("smc-degraded", state.control_status)
+        self.assertEqual((None,), report.actual_rpm)
+        self.assertEqual(
+            "0", fan.base_path.with_name("fan1_manual").read_text()
+        )
+        self.assertEqual("321", output.read_text())
+        with self.capture_output() as (stdout, stderr):
+            MODULE.emit_verbose(report, [fan], self.smc_config(), state)
+        self.assertIn("sensor_status=degraded", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+
+    def test_malformed_smc_policy_warns_but_t2fand_mode_fails_high(self):
+        path = self.root / "config"
+        path.write_text(
+            "[General]\ncontrol_mode=smc\n[Fan1]\n"
+            "low_temp=bad\nhigh_temp=75\n"
+            "speed_curve=linear\nalways_full_speed=false\n"
+        )
+        result = MODULE.load_configuration(path, 1)
+        self.assertTrue(result.valid)
+        self.assertIn("Fan1.low_temp is malformed", result.warnings)
+        state = MODULE.ControllerState()
+        with self.capture_output():
+            report = MODULE.run_cycle(
+                [self.fan()], result, state, self.root, now=0
+            )
+        self.assertEqual((0,), report.manual)
+        self.assertEqual(
+            "0", self.fan().base_path.with_name("fan1_output").read_text()
+        )
+        path.write_text(
+            "[General]\ncontrol_mode=t2fand\n[Fan1]\n"
+            "low_temp=bad\nhigh_temp=75\n"
+            "speed_curve=linear\nalways_full_speed=false\n"
+        )
+        t2fand_result = MODULE.load_configuration(path, 1)
+        self.assertFalse(t2fand_result.valid)
+        with self.capture_output():
+            report = MODULE.run_cycle(
+                [self.fan()],
+                t2fand_result,
+                MODULE.ControllerState(),
+                self.root,
+                now=1,
+            )
+        self.assertEqual((1000,), report.targets)
+
+    def test_clean_shutdown_release_works_in_both_modes(self):
+        fan = self.fan()
+        fan.enable_manual()
+        MODULE.cleanup_fans([fan])
+        self.assertEqual(
+            "0", fan.base_path.with_name("fan1_manual").read_text()
+        )
+        fan.base_path.with_name("fan1_manual").write_text("1")
+        MODULE.cleanup_fans([fan])
+        self.assertEqual(
+            "0", fan.base_path.with_name("fan1_manual").read_text()
+        )
+
+    def test_verbose_flag_remains_accepted(self):
+        parser = MODULE._parser()
+        self.assertTrue(parser.parse_args(["--verbose"]).verbose)
+        self.assertIn("emit full telemetry", parser.format_help())
+        self.assertNotIn(
+            "one telemetry record per second", parser.format_help()
+        )
+
+    def test_cli_defaults_and_runtime_values_are_local(self):
+        args = MODULE._parser().parse_args([])
+        self.assertEqual(MODULE.DEFAULT_CONFIG_PATH, args.config_path)
+        self.assertEqual(MODULE.DEFAULT_PID_PATH, args.pid_path)
+        self.assertEqual(MODULE.DEFAULT_SYSFS_ROOT, args.sysfs_path)
+        self.assertEqual(5, args.sensor_recovery_cycles)
+        self.assertEqual(5, args.sample_limit)
+        self.assertEqual(60.0, args.error_reminder_seconds)
+
+        state = MODULE.ControllerState()
+        with self.capture_output():
+            MODULE.run_cycle(
+                [self.fan()],
+                self.config(),
+                state,
+                self.root,
+                now=0,
+                settings=MODULE.RuntimeSettings(2, 2, 1.5),
+            )
+        self.assertEqual(2, state.sensor_recovery_cycles)
+        self.assertEqual(2, state.sample_limit)
+        self.assertEqual(1.5, state.error_reminder_seconds)
+        self.assertEqual(5, MODULE.SENSOR_RECOVERY_CYCLES)
+        self.assertEqual(5, MODULE.SAMPLE_LIMIT)
+        self.assertEqual(60.0, MODULE.ERROR_REMINDER_SECONDS)
+
+    def test_cli_short_forms_match_long_forms_and_help_defaults(self):
+        parser = MODULE._parser()
+        options = (
+            (
+                "-c",
+                "--config-path",
+                "custom.conf",
+                "config_path",
+                Path("custom.conf"),
+                "/etc/t2fand.conf",
+            ),
+            (
+                "-p",
+                "--pid-path",
+                "custom.pid",
+                "pid_path",
+                Path("custom.pid"),
+                "/run/t2fand.pid",
+            ),
+            ("-s", "--sysfs-path", "sys", "sysfs_path", Path("sys"), "/sys"),
+            (
+                "-r",
+                "--sensor-recovery-cycles",
+                "7",
+                "sensor_recovery_cycles",
+                7,
+                "5",
+            ),
+            ("-l", "--sample-limit", "9", "sample_limit", 9, "5"),
+            (
+                "-e",
+                "--error-reminder-seconds",
+                "2.5",
+                "error_reminder_seconds",
+                2.5,
+                "60.0",
+            ),
+        )
+        with self.capture_output() as (stdout, stderr):
+            with self.assertRaises(SystemExit) as exit_info:
+                parser.parse_args(["--help"])
+        self.assertEqual(0, exit_info.exception.code)
+        self.assertEqual("", stderr.getvalue())
+        help_text = stdout.getvalue()
+        for short, long, value, dest, expected, default in options:
+            with self.subTest(option=short):
+                short_args = parser.parse_args([short, value])
+                long_args = parser.parse_args([long, value])
+                self.assertEqual(vars(long_args), vars(short_args))
+                self.assertEqual(expected, getattr(short_args, dest))
+                self.assertIn(short, help_text)
+                self.assertIn(long, help_text)
+                self.assertIn(f"(default: {default})", help_text)
+
+    def test_cli_numeric_validation_precedes_root_check(self):
+        for option, value in (
+            ("--sensor-recovery-cycles", "0"),
+            ("--sample-limit", "-1"),
+            ("--sensor-recovery-cycles", "not-an-int"),
+            ("--error-reminder-seconds", "0"),
+            ("--error-reminder-seconds", "-0.5"),
+            ("--error-reminder-seconds", "not-a-float"),
+            ("--error-reminder-seconds", "nan"),
+            ("--error-reminder-seconds", "inf"),
+        ):
+            with self.subTest(option=option, value=value), mock.patch.object(
+                MODULE.os, "geteuid"
+            ) as geteuid:
+                with self.capture_output():
+                    with self.assertRaises(SystemExit):
+                        MODULE.main([option, value])
+            geteuid.assert_not_called()
+
+    def test_main_consumes_custom_paths_and_cleans_custom_pid(self):
+        pid_path = self.root / "run/custom.pid"
+        config_path = self.root / "etc/custom.conf"
+        settings = MODULE.ConfigResult([self.config().policies[0]])
+        with mock.patch.object(
+            MODULE.os, "geteuid", return_value=0
+        ), mock.patch.object(
+            MODULE, "prepare_pid"
+        ) as prepare_pid, mock.patch.object(
+            MODULE, "discover_fans", return_value=([self.fan()], [])
+        ) as discover_fans, mock.patch.object(
+            MODULE, "load_configuration", return_value=settings
+        ) as load_configuration, mock.patch.object(
+            MODULE, "install_signal_handlers"
+        ), mock.patch.object(
+            MODULE, "write_pid"
+        ) as write_pid, mock.patch.object(
+            MODULE, "run_loop"
+        ) as run_loop, mock.patch.object(MODULE, "remove_pid") as remove_pid:
+            with self.capture_output():
+                result = MODULE.main(
+                    [
+                        "--config-path",
+                        str(config_path),
+                        "--pid-path",
+                        str(pid_path),
+                        "--sysfs-path",
+                        str(self.root),
+                        "--sensor-recovery-cycles",
+                        "2",
+                        "--sample-limit",
+                        "3",
+                        "--error-reminder-seconds",
+                        "4.5",
+                    ]
+                )
+        self.assertEqual(0, result)
+        prepare_pid.assert_called_once_with(pid_path)
+        discover_fans.assert_called_once_with(self.root)
+        load_configuration.assert_called_once_with(config_path, 1)
+        write_pid.assert_called_once_with(pid_path)
+        remove_pid.assert_called_once_with(pid_path)
+        run_settings = run_loop.call_args.kwargs["settings"]
+        self.assertEqual(MODULE.RuntimeSettings(2, 3, 4.5), run_settings)
+
+    def test_invalid_general_mode_is_startup_control_error_without_mutation(
+        self,
+    ):
+        fan = self.fan()
+        cases = (
+            (
+                "manual",
+                "[General]\ncontrol_mode=manual\n",
+                "must be smc or t2fand",
+            ),
+            ("auto", "[General]\ncontrol_mode=auto\n", "must be smc or t2fand"),
+            (
+                "smc_auto",
+                "[General]\ncontrol_mode=smc_auto\n",
+                "must be smc or t2fand",
+            ),
+            ("SMC", "[General]\ncontrol_mode=SMC\n", "must be smc or t2fand"),
+            ("missing", "[General]\n", "is missing"),
+            (
+                "arbitrary",
+                "[General]\ncontrol_mode=invalid\n",
+                "must be smc or t2fand",
+            ),
+        )
+        for value, contents, expected in cases:
+            with self.subTest(value=value):
+                path = self.root / "config"
+                path.write_text(contents)
+                with mock.patch.object(
+                    MODULE.os, "geteuid", return_value=0
+                ), mock.patch.object(
+                    MODULE, "DEFAULT_PID_PATH", self.root / "run.pid"
+                ), mock.patch.object(
+                    MODULE, "DEFAULT_CONFIG_PATH", path
+                ), mock.patch.object(MODULE, "prepare_pid"), mock.patch.object(
+                    MODULE, "discover_fans", return_value=([fan], [])
+                ):
+                    with self.capture_output() as (stdout, stderr):
+                        result = MODULE.main([])
+                self.assertEqual(1, result)
+                self.assertIn("control-error", stdout.getvalue())
+                self.assertIn(
+                    f"General.control_mode {expected}", stderr.getvalue()
+                )
+                if value != "missing":
+                    self.assertNotIn(value, stderr.getvalue())
+                self.assertEqual(
+                    "0", fan.base_path.with_name("fan1_manual").read_text()
+                )
+                self.assertEqual(
+                    "0", fan.base_path.with_name("fan1_output").read_text()
+                )
 
 
 class OutputAndLifecycleTests(FakeSysfs):
@@ -700,9 +1433,11 @@ class OutputAndLifecycleTests(FakeSysfs):
         self.assertEqual("", stderr.getvalue())
         text = output.getvalue()
         for field in (
+            "control_mode=t2fand",
             "iwlwifi:temp1=45.0",
             "nvme:Composite=70.0",
             "gpu_temps=present",
+            "highest=nvme:Composite",
             "highest_temp=70.0",
             "rolling_mean=70.0",
             "mode=curve",
@@ -945,7 +1680,7 @@ class OutputAndLifecycleTests(FakeSysfs):
         remove_pid.assert_called_once_with(pid_path)
         self.assertFalse(pid_path.exists())
 
-    def test_manual_enable_failure_is_fatal_and_cleans_up_known_fans(self):
+    def test_t2fand_enable_failure_is_fatal_and_cleans_up_known_fans(self):
         self.add_t2_fan()
         fans, errors = MODULE.discover_fans(self.root)
         self.assertEqual([], errors)
@@ -956,12 +1691,20 @@ class OutputAndLifecycleTests(FakeSysfs):
         failed_manual.mkdir()
 
         pid_path = self.root / "run.pid"
+        config_path = self.root / "config"
+        config_path.write_text(
+            "[General]\ncontrol_mode=t2fand\n"
+            "[Fan1]\nlow_temp=55\nhigh_temp=75\n"
+            "speed_curve=linear\nalways_full_speed=false\n"
+            "[Fan2]\nlow_temp=55\nhigh_temp=75\n"
+            "speed_curve=linear\nalways_full_speed=false\n"
+        )
         with mock.patch.object(
             MODULE.os, "geteuid", return_value=0
         ), mock.patch.object(
             MODULE, "DEFAULT_PID_PATH", pid_path
         ), mock.patch.object(
-            MODULE, "DEFAULT_CONFIG_PATH", self.root / "config"
+            MODULE, "DEFAULT_CONFIG_PATH", config_path
         ), mock.patch.object(
             MODULE, "discover_fans", return_value=(fans, errors)
         ), mock.patch.object(MODULE, "install_signal_handlers"):
@@ -1027,6 +1770,111 @@ class OutputAndLifecycleTests(FakeSysfs):
 
 
 class StaticContractTests(unittest.TestCase):
+    def test_benchmark_log_uses_local_english_timestamp_and_logger(self):
+        benchmark = BENCHMARK_SOURCE
+        tree = ast.parse(benchmark.read_text())
+        log_node = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "log"
+        )
+        previous_locale = locale.setlocale(locale.LC_TIME)
+        selected_locale = None
+        for candidate in ("fr_FR.UTF-8", "de_DE.UTF-8", "es_ES.UTF-8"):
+            try:
+                locale.setlocale(locale.LC_TIME, candidate)
+            except locale.Error:
+                continue
+            selected_locale = candidate
+            break
+        if selected_locale is None:
+            self.skipTest("no non-English LC_TIME locale is installed")
+        try:
+            clock = mock.Mock()
+            clock.localtime.return_value = types.SimpleNamespace(
+                tm_mon=9, tm_mday=3, tm_hour=4, tm_min=5, tm_sec=6
+            )
+            clock.strftime.side_effect = AssertionError(
+                "benchmark log must not use locale-sensitive formatting"
+            )
+            logger = mock.Mock()
+            namespace = {
+                "time": clock,
+                "subprocess": types.SimpleNamespace(run=logger),
+            }
+            exec(
+                compile(ast.Module([log_node], []), str(benchmark), "exec"),
+                namespace,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                namespace["log"]("MESSAGE")
+            self.assertEqual(
+                "Sep 03 04:05:06 [t2fanbench] MESSAGE\n", output.getvalue()
+            )
+            logger.assert_called_once_with(
+                ["logger", "-t", "t2fanbench", "MESSAGE"], check=False
+            )
+            clock.strftime.assert_not_called()
+        finally:
+            locale.setlocale(locale.LC_TIME, previous_locale)
+
+    def test_benchmark_requires_stress_ng_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            cache = Path(tempdir) / "cache"
+            with mock.patch.object(
+                BENCHMARK.shutil, "which", return_value=None
+            ) as which, mock.patch.object(
+                BENCHMARK, "TEMP_PATH", cache
+            ), mock.patch.object(BENCHMARK, "log") as log, mock.patch.object(
+                BENCHMARK, "run"
+            ) as run, mock.patch.object(
+                BENCHMARK, "cooldown"
+            ) as cooldown, mock.patch.object(
+                BENCHMARK.time, "sleep"
+            ) as sleep, mock.patch.object(
+                BENCHMARK.subprocess, "run"
+            ) as subprocess_run:
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(
+                    stdout
+                ), contextlib.redirect_stderr(stderr):
+                    result = BENCHMARK.main()
+            cache_created = cache.exists()
+
+        self.assertEqual(1, result)
+        self.assertEqual(
+            "error: stress-ng is required but was not found in PATH\n",
+            stderr.getvalue(),
+        )
+        self.assertEqual("", stdout.getvalue())
+        self.assertFalse(cache_created)
+        which.assert_called_once_with("stress-ng")
+        log.assert_not_called()
+        run.assert_not_called()
+        cooldown.assert_not_called()
+        sleep.assert_not_called()
+        subprocess_run.assert_not_called()
+
+    def test_benchmark_present_path_starts_without_real_workloads_or_timers(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tempdir:
+            cache = Path(tempdir) / "cache"
+            with mock.patch.object(
+                BENCHMARK.shutil, "which", return_value="/usr/bin/stress-ng"
+            ) as which, mock.patch.object(
+                BENCHMARK, "TEMP_PATH", cache
+            ), mock.patch.object(BENCHMARK, "benchmark") as benchmark:
+                result = BENCHMARK.main()
+            cache_created = cache.is_dir()
+
+        self.assertEqual(0, result)
+        self.assertTrue(cache_created)
+        which.assert_called_once_with("stress-ng")
+        benchmark.assert_called_once_with()
+
     def test_import_safety_cli_guard_and_named_state(self):
         tree = ast.parse(SOURCE.read_text())
         source = SOURCE.read_text()
@@ -1060,10 +1908,75 @@ class StaticContractTests(unittest.TestCase):
             makefile, r"(?m)^test:\n\tpython3 -m unittest discover"
         )
 
-    def test_openrc_supervision_logger_and_arguments_are_static_contract(self):
+    def test_confd_has_only_optional_args_assignment_and_install_mode(self):
+        confd = (SOURCE.parent / "t2fand.confd").read_text()
+        assignments = re.findall(r"(?m)^([A-Za-z_][A-Za-z0-9_]*)=", confd)
+        self.assertEqual(["t2fand_args"], assignments)
+        self.assertIn('t2fand_args=""', confd)
+        self.assertIn("t2fand owns daemon defaults and options", confd)
+        self.assertIn("t2fand_args provides optional overrides", confd)
+        self.assertIn("t2fand --help is authoritative", confd)
+        self.assertIn(
+            'Example: t2fand_args="--verbose --sensor-recovery-cycles 10"',
+            confd,
+        )
+        for removed in (
+            "t2fand_config_path",
+            "t2fand_pid_path",
+            "t2fand_sysfs_path",
+            "t2fand_sensor_recovery_cycles",
+            "t2fand_sample_limit",
+            "t2fand_error_reminder_seconds",
+        ):
+            self.assertNotIn(removed, confd)
+        makefile = (SOURCE.parent / "Makefile").read_text()
+        self.assertIn("OPENRC_CONFDIR ?= /etc/conf.d", makefile)
+
+    def test_openrc_optional_args_are_static_and_ordered(self):
         initd = (SOURCE.parent / "t2fand.initd").read_text()
+        command_args = re.search(r'(?m)^command_args="([^"]*)"$', initd).group(
+            1
+        )
+        self.assertEqual(1, initd.count("command_args="))
+        self.assertEqual("${t2fand_args:-}", command_args)
+        for configured, expected in (
+            (None, []),
+            ("", []),
+            ("--verbose", ["--verbose"]),
+            (
+                "--verbose --sensor-recovery-cycles 10",
+                ["--verbose", "--sensor-recovery-cycles", "10"],
+            ),
+            (
+                "--sensor-recovery-cycles 10 --verbose",
+                ["--sensor-recovery-cycles", "10", "--verbose"],
+            ),
+        ):
+            with self.subTest(configured=configured):
+                environment = (
+                    {} if configured is None else {"t2fand_args": configured}
+                )
+                expanded = command_args.replace(
+                    "${t2fand_args:-}",
+                    environment.get("t2fand_args") or "",
+                )
+                self.assertEqual(expected, shlex.split(expanded))
+        for removed in (
+            "--config-path",
+            "--pid-path",
+            "--sysfs-path",
+            "--sensor-recovery-cycles",
+            "--sample-limit",
+            "--error-reminder-seconds",
+            "t2fand_config_path",
+            "t2fand_pid_path",
+            "t2fand_sysfs_path",
+            "t2fand_sensor_recovery_cycles",
+            "t2fand_sample_limit",
+            "t2fand_error_reminder_seconds",
+        ):
+            self.assertNotIn(removed, initd)
         self.assertIn('supervisor="supervise-daemon"', initd)
-        self.assertIn('command_args="${t2fand_args:-}"', initd)
         self.assertIn(
             'output_logger="/usr/bin/logger -t t2fand -p daemon.info"', initd
         )
@@ -1092,16 +2005,31 @@ class StaticContractTests(unittest.TestCase):
         package = (SOURCE.parent / "PKGBUILD").read_text()
         makefile = (SOURCE.parent / "Makefile").read_text()
         self.assertIn("pkgname=t2fand", package)
-        self.assertRegex(package, r"(?m)^pkgver=2\.0\.0$")
-        self.assertRegex(package, r"(?m)^pkgrel=1$")
+        self.assertRegex(package, r"(?m)^pkgver=2\.0\.1$")
+        self.assertRegex(package, r"(?m)^pkgrel=2$")
         self.assertRegex(
             package, r"(?m)^depends=\('linux-t2' 'python' 'util-linux'\)$"
         )
-        self.assertIn('install -Dm700 t2fand "$pkgdir/usr/bin/t2fand"', package)
-        self.assertIn(
-            'install -Dm755 t2fand.initd "$pkgdir/etc/init.d/t2fand"', package
+        self.assertRegex(
+            package,
+            r"(?m)^source=\('t2fand' 't2fand\.initd' 't2fand\.confd' 'Makefile'\)$",
         )
-        self.assertEqual(2, len(re.findall(r"(?m)^\s*install -Dm", package)))
+        self.assertIn("backup=('etc/conf.d/t2fand')", package)
+        self.assertIn('make DESTDIR="$pkgdir" install', package)
+        self.assertIn(
+            'install -D -m 0700 "t2fand" "$(DESTDIR)$(BINDIR)/t2fand"',
+            makefile,
+        )
+        self.assertIn(
+            'install -D -m 0755 "t2fand.initd" "$(DESTDIR)$(OPENRC_INITDDIR)/t2fand"',
+            makefile,
+        )
+        self.assertIn("OPENRC_CONFDIR ?= /etc/conf.d", makefile)
+        self.assertIn(
+            'install -D -m 0644 "t2fand.confd" "$(DESTDIR)$(OPENRC_CONFDIR)/t2fand"',
+            makefile,
+        )
+        self.assertEqual(3, len(re.findall(r"(?m)^\s*install -D -m", makefile)))
         self.assertNotIn("systemd", package.lower())
         self.assertNotIn("INIT_SYSTEM", package)
         self.assertNotIn("INIT_SYSTEM", makefile)

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0
-"""Foreground OpenRC fan controller with global thermal fail-safe behavior.
+"""Foreground fan controller with SMC monitoring and t2fand fail-safe behavior.
 
 The daemon reads and writes sysfs paths by reopening them for every operation.
-Temperature or policy failures fail high while fan control remains available;
-loss of maximum-speed control is fatal so OpenRC can recover the process.
+T2fand-mode temperature or policy failures fail high while fan control remains
+available; SMC reports sensor failures as degraded monitoring. Loss of
+maximum-speed control is fatal so OpenRC can recover the process.
 """
 
 import argparse
@@ -25,7 +26,7 @@ DEFAULT_CONFIG_PATH = Path("/etc/t2fand.conf")
 DEFAULT_PID_PATH = Path("/run/t2fand.pid")
 DEFAULT_SYSFS_ROOT = Path("/sys")
 SENSOR_RECOVERY_CYCLES = 5
-SAMPLE_LIMIT = 5
+SAMPLE_LIMIT = 10
 ERROR_REMINDER_SECONDS = 60.0
 CURVES = ("linear", "exponential", "logarithmic")
 
@@ -50,6 +51,22 @@ class FanConfig:
     high_temp: float
     speed_curve: str
     always_full_speed: bool
+
+
+@dataclass(frozen=True)
+class GeneralConfig:
+    """Validated global control selection."""
+
+    control_mode: Optional[str]
+
+
+@dataclass(frozen=True)
+class RuntimeSettings:
+    """Validated per-process runtime tuning."""
+
+    sensor_recovery_cycles: int = SENSOR_RECOVERY_CYCLES
+    sample_limit: int = SAMPLE_LIMIT
+    error_reminder_seconds: float = ERROR_REMINDER_SECONDS
 
 
 @dataclass
@@ -100,6 +117,16 @@ class Fan:
 
         self._sidecar("_manual").write_text("0")
 
+    def read_manual(self) -> int:
+        """Read the current manual-control flag, reopening the input path."""
+
+        return int(self._sidecar("_manual").read_text().strip())
+
+    def read_target_rpm(self) -> int:
+        """Read the current fan target, reopening the output path."""
+
+        return int(self._sidecar("_output").read_text().strip())
+
     def read_actual_rpm(self) -> int:
         """Read one tachometer value, reopening the input path."""
 
@@ -137,20 +164,34 @@ class SensorSnapshot:
     gpu_present: bool
     valid: bool
     reason: str
+    dgpu_state: str = "unknown"
+    highest_label: Optional[str] = None
 
 
 @dataclass
 class ConfigResult:
-    """Startup configuration result; invalid policies are represented by None."""
+    """Startup configuration result with mode-specific policy validity."""
 
     policies: list[Optional[FanConfig]]
     errors: list[str] = field(default_factory=list)
+    general: GeneralConfig = field(default_factory=lambda: GeneralConfig("t2fand"))
+    warnings: list[str] = field(default_factory=list)
+    startup_error: bool = False
 
     @property
     def valid(self) -> bool:
         """Return whether every detected fan has a validated policy."""
 
-        return not self.errors and all(policy is not None for policy in self.policies)
+        return not self.errors and self.control_mode in {"smc", "t2fand"} and (
+            self.control_mode == "smc"
+            or all(policy is not None for policy in self.policies)
+        )
+
+    @property
+    def control_mode(self) -> Optional[str]:
+        """Return the selected global mode."""
+
+        return self.general.control_mode
 
 
 @dataclass
@@ -168,6 +209,12 @@ class ControllerState:
     last_problem_at: Optional[float] = None
     config_failsafe: bool = False
     config_failure_reason: Optional[str] = None
+    control_mode: Optional[str] = None
+    control_status: str = ""
+    maximum_escalated: bool = False
+    sensor_recovery_cycles: int = SENSOR_RECOVERY_CYCLES
+    sample_limit: int = SAMPLE_LIMIT
+    error_reminder_seconds: float = ERROR_REMINDER_SECONDS
 
 
 @dataclass(frozen=True)
@@ -178,6 +225,7 @@ class CycleReport:
     rolling_mean: Optional[float]
     targets: tuple[Optional[int], ...]
     actual_rpm: tuple[Optional[int], ...]
+    manual: tuple[Optional[int], ...] = ()
 
 
 def emit(message: str, error: bool = False, stream: Optional[TextIO] = None) -> None:
@@ -244,22 +292,33 @@ def _drm_card(path: Path) -> Optional[str]:
     return None
 
 
-def _off_dgpu_pci(sysfs_root: Path) -> Optional[str]:
+def _switcheroo_state(sysfs_root: Path) -> tuple[Optional[str], str]:
+    """Return the powered-off dGPU PCI identity and topology state."""
+
     switch_path = sysfs_root / "kernel/debug/vgaswitcheroo/switch"
     try:
         lines = switch_path.read_text().splitlines()
     except (OSError, UnicodeError):
-        return None
+        return None, "unknown"
 
+    has_dgpu = False
     for line in lines:
         match = re.match(
-            r"^\d+:DIS:[^:]*:Off:(\d{4}:\d{2}:\d{2}\.\d+)$",
+            r"^\d+:DIS:[^:]*:(On|Off):(\d{4}:\d{2}:\d{2}\.\d+)$",
             line,
             re.IGNORECASE,
         )
         if match:
-            return match.group(1)
-    return None
+            has_dgpu = True
+            if match.group(1).lower() == "off":
+                return match.group(2), "off"
+    return None, "on" if has_dgpu else "unknown"
+
+
+def _off_dgpu_pci(sysfs_root: Path) -> Optional[str]:
+    """Return the powered-off dGPU PCI identity, when switch state is readable."""
+
+    return _switcheroo_state(sysfs_root)[0]
 
 
 def _sensor_candidates(sysfs_root: Path) -> list[SensorCandidate]:
@@ -357,16 +416,27 @@ def discover_sensors(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> SensorSnapshot:
     candidates = _sensor_candidates(sysfs_root)
     readings: list[SensorReading] = []
     failures: list[str] = []
-    valid_values: list[float] = []
+    highest: Optional[float] = None
+    highest_label: Optional[str] = None
     cpu_valid = False
-    gpu_present = any(candidate.is_gpu for candidate in candidates)
-    off_dgpu_pci = _off_dgpu_pci(sysfs_root)
+    off_dgpu_pci, dgpu_state = _switcheroo_state(sysfs_root)
+    gpu_present = off_dgpu_pci is not None
 
     for candidate in candidates:
+        label = _sensor_label(candidate)
+        gpu_present = gpu_present or candidate.is_gpu
         if off_dgpu_pci is not None and off_dgpu_pci in candidate.path.parts:
+            readings.append(
+                SensorReading(
+                    label,
+                    None,
+                    candidate.is_cpu,
+                    candidate.is_gpu,
+                    "dGPU powered off; skipped",
+                )
+            )
             continue
 
-        label = _sensor_label(candidate)
         try:
             raw_value = candidate.path.read_text().strip()
             raw_millidegrees = int(raw_value)
@@ -382,14 +452,15 @@ def discover_sensors(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> SensorSnapshot:
         if error is not None:
             failures.append(error)
         else:
-            valid_values.append(value)
+            if highest is None or value > highest:
+                highest = value
+                highest_label = label
             if candidate.is_cpu and value > 0:
                 cpu_valid = True
         readings.append(
             SensorReading(label, value, candidate.is_cpu, candidate.is_gpu, error)
         )
 
-    highest = max(valid_values) if valid_values else None
     if not candidates:
         reason = "no temperature sensors discovered"
     elif not cpu_valid:
@@ -401,7 +472,16 @@ def discover_sensors(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> SensorSnapshot:
     else:
         reason = "normal sensor input"
     valid = bool(candidates) and cpu_valid and highest is not None and not failures
-    return SensorSnapshot(tuple(readings), highest, cpu_valid, gpu_present, valid, reason)
+    return SensorSnapshot(
+        tuple(readings),
+        highest,
+        cpu_valid,
+        gpu_present,
+        valid,
+        reason,
+        dgpu_state,
+        highest_label,
+    )
 
 
 def _validate_policy(section: str, config: configparser.RawConfigParser) -> FanConfig:
@@ -438,6 +518,7 @@ def _validate_policy(section: str, config: configparser.RawConfigParser) -> FanC
 
 def _default_config(fan_count: int) -> configparser.RawConfigParser:
     config = configparser.RawConfigParser()
+    config["General"] = {"control_mode": "smc"}
     for index in range(fan_count):
         config[f"Fan{index + 1}"] = {
             "low_temp": "55",
@@ -457,7 +538,10 @@ def load_configuration(config_path: Path, fan_count: int) -> ConfigResult:
                 _default_config(fan_count).write(config_file)
         except (OSError, UnicodeError) as exc:
             return ConfigResult(
-                [None] * fan_count, [f"{config_path}: cannot generate config: {exc}"]
+                [None] * fan_count,
+                [f"{config_path}: cannot generate config: {exc}"],
+                GeneralConfig(None),
+                startup_error=True,
             )
 
     config = configparser.RawConfigParser()
@@ -465,10 +549,33 @@ def load_configuration(config_path: Path, fan_count: int) -> ConfigResult:
         with config_path.open() as config_file:
             config.read_file(config_file)
     except (OSError, UnicodeError, configparser.Error) as exc:
-        return ConfigResult([None] * fan_count, [f"{config_path}: cannot read config: {exc}"])
+        return ConfigResult(
+            [None] * fan_count,
+            [f"{config_path}: cannot read config: {exc}"],
+            GeneralConfig(None),
+            startup_error=True,
+        )
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    startup_error = False
+    if not config.has_section("General"):
+        general = GeneralConfig("t2fand")
+        warnings.append("legacy configuration without [General]; using t2fand mode")
+    elif not config.has_option("General", "control_mode"):
+        general = GeneralConfig(None)
+        errors.append("General.control_mode is missing")
+        startup_error = True
+    else:
+        control_mode = config.get("General", "control_mode").strip()
+        if control_mode not in {"smc", "t2fand"}:
+            general = GeneralConfig(None)
+            errors.append("General.control_mode must be smc or t2fand")
+            startup_error = True
+        else:
+            general = GeneralConfig(control_mode)
 
     policies: list[Optional[FanConfig]] = []
-    errors: list[str] = []
     for index in range(fan_count):
         section = f"Fan{index + 1}"
         if not config.has_section(section):
@@ -480,9 +587,10 @@ def load_configuration(config_path: Path, fan_count: int) -> ConfigResult:
         except ValueError as exc:
             errors.append(str(exc))
             policies.append(None)
-    if errors:
-        return ConfigResult(policies, errors)
-    return ConfigResult(policies)
+    if general.control_mode == "smc":
+        warnings.extend(errors)
+        errors = []
+    return ConfigResult(policies, errors, general, warnings, startup_error)
 
 
 def calculate_target(fan: Fan, policy: FanConfig, temperature: float) -> int:
@@ -528,17 +636,24 @@ def _set_mode(state: ControllerState, mode: str, reason: str, now: float) -> Non
     if changed:
         state.last_problem_at = now
         emit(f"mode transition: mode={mode} reason={reason}")
-    elif mode not in {"curve", "configured-full"} and (
-        state.last_problem_at is None or now - state.last_problem_at >= ERROR_REMINDER_SECONDS
+    elif (
+        mode in {"sensor-failsafe", "config-failsafe", "control-error"}
+        or state.control_status == "smc-degraded"
+    ) and (
+        state.last_problem_at is None
+        or now - state.last_problem_at >= state.error_reminder_seconds
     ):
         state.last_problem_at = now
         emit(f"warning: mode={mode} reason={reason}")
 
 
-def _update_gpu_state(state: ControllerState, present: bool) -> None:
+def _update_gpu_state(
+    state: ControllerState, present: bool, dgpu_state: str = "unknown"
+) -> None:
+    present = present or dgpu_state == "off"
     if state.gpu_present is None:
         state.gpu_present = present
-        if not present:
+        if not present and dgpu_state != "off":
             emit("warning: gpu-missing")
     elif state.gpu_present != present:
         state.gpu_present = present
@@ -554,6 +669,146 @@ def _reset_sensor_recovery(state: ControllerState) -> None:
 
 def _maximum_targets(fans: Sequence[Fan]) -> tuple[Optional[int], ...]:
     return tuple(fan.maximum for fan in fans)
+
+
+def _ownership_failure(
+    fans: Sequence[Fan], errors: Sequence[str], state: ControllerState, now: float
+) -> None:
+    """Escalate an SMC ownership failure without claiming automatic control."""
+
+    detail = "SMC ownership release failed: " + "; ".join(errors)
+    maximum_errors = attempt_maximum(fans)
+    state.maximum_escalated = True
+    if maximum_errors:
+        detail += "; maximum escalation failed: " + "; ".join(maximum_errors)
+    state.control_status = "control-error"
+    _set_mode(state, "control-error", detail, now)
+    raise FatalControlError(detail)
+
+
+def release_smc_ownership(
+    fans: Sequence[Fan], state: Optional[ControllerState] = None, now: Optional[float] = None
+) -> None:
+    """Release and verify every fan, escalating any ownership loss."""
+
+    errors: list[str] = []
+    for fan in fans:
+        try:
+            fan.disable_manual()
+            manual = fan.read_manual()
+            if manual != 0:
+                errors.append(f"{fan.name}: manual state is {manual}, expected 0")
+        except (OSError, ValueError, UnicodeError) as exc:
+            errors.append(f"{fan.name}: manual release or verification failed: {exc}")
+    if errors:
+        if state is None:
+            maximum_errors = attempt_maximum(fans)
+            detail = "SMC ownership release failed: " + "; ".join(errors)
+            if maximum_errors:
+                detail += "; maximum escalation failed: " + "; ".join(maximum_errors)
+            raise FatalControlError(detail)
+        _ownership_failure(fans, errors, state, time.monotonic() if now is None else now)
+
+
+def _maintain_smc_ownership(
+    fans: Sequence[Fan], state: ControllerState, now: float
+) -> tuple[Optional[int], ...]:
+    """Re-read and restore manual ownership state without ordinary output writes."""
+
+    errors: list[str] = []
+    observed: list[Optional[int]] = []
+    for fan in fans:
+        read_error: Optional[str] = None
+        try:
+            manual = fan.read_manual()
+        except (OSError, ValueError, UnicodeError) as exc:
+            manual = None
+            read_error = str(exc)
+        observed.append(manual)
+        if manual == 0:
+            continue
+        if manual == 1:
+            emit(f"warning: {fan.name}: unexpected manual=1; restoring SMC ownership", error=True)
+        elif read_error is not None:
+            emit(
+                f"warning: {fan.name}: manual state unavailable: {read_error}; restoring SMC ownership",
+                error=True,
+            )
+        else:
+            emit(
+                f"warning: {fan.name}: malformed manual state {manual}; restoring SMC ownership",
+                error=True,
+            )
+        try:
+            fan.disable_manual()
+            if fan.read_manual() != 0:
+                errors.append(f"{fan.name}: manual state did not restore to 0")
+            else:
+                observed[-1] = 0
+        except (OSError, ValueError, UnicodeError) as exc:
+            errors.append(f"{fan.name}: manual ownership restore failed: {exc}")
+    if errors:
+        _ownership_failure(fans, errors, state, now)
+    return tuple(observed)
+
+
+def _read_fan_observations(
+    fans: Sequence[Fan],
+    manual_values: Optional[tuple[Optional[int], ...]] = None,
+    actual_values: Optional[tuple[Optional[int], ...]] = None,
+) -> tuple[tuple[Optional[int], ...], tuple[Optional[int], ...], tuple[Optional[int], ...], Optional[str]]:
+    """Read manual, target, and actual fan values for telemetry."""
+
+    manual: list[Optional[int]] = []
+    targets: list[Optional[int]] = []
+    actual: list[Optional[int]] = []
+    actual_error: Optional[str] = None
+    if manual_values is None:
+        for fan in fans:
+            try:
+                manual.append(fan.read_manual())
+            except (OSError, ValueError, UnicodeError):
+                manual.append(None)
+    else:
+        manual.extend(manual_values)
+    for fan in fans:
+        try:
+            targets.append(fan.read_target_rpm())
+        except (OSError, ValueError, UnicodeError):
+            targets.append(None)
+    if actual_values is None:
+        for fan in fans:
+            try:
+                actual.append(fan.read_actual_rpm())
+            except (OSError, ValueError, UnicodeError) as exc:
+                actual.append(None)
+                if actual_error is None:
+                    actual_error = f"{fan.name}: actual RPM unavailable: {exc}"
+    else:
+        actual.extend(actual_values)
+    return tuple(manual), tuple(targets), tuple(actual), actual_error
+
+
+def _run_smc_cycle(
+    fans: Sequence[Fan],
+    state: ControllerState,
+    sysfs_root: Path,
+    now: float,
+) -> CycleReport:
+    """Monitor one SMC cycle without taking over fan output."""
+
+    snapshot = discover_sensors(sysfs_root)
+    _update_gpu_state(state, snapshot.gpu_present, snapshot.dgpu_state)
+    manual_values = _maintain_smc_ownership(fans, state, now)
+    manual, targets, actual, actual_error = _read_fan_observations(
+        fans, manual_values=manual_values
+    )
+    state.control_status = (
+        "smc-auto" if snapshot.valid and actual_error is None else "smc-degraded"
+    )
+    reason = "SMC monitoring" if snapshot.valid else snapshot.reason
+    _set_mode(state, "smc", reason, now)
+    return CycleReport(snapshot, None, targets, actual, manual)
 
 
 def attempt_maximum(fans: Sequence[Fan]) -> list[str]:
@@ -585,12 +840,25 @@ def run_cycle(
     state: ControllerState,
     sysfs_root: Path = DEFAULT_SYSFS_ROOT,
     now: Optional[float] = None,
+    settings: Optional[RuntimeSettings] = None,
 ) -> CycleReport:
     """Discover, classify, control, and report one one-second cycle."""
 
+    runtime = settings or RuntimeSettings()
+    state.sensor_recovery_cycles = runtime.sensor_recovery_cycles
+    state.sample_limit = runtime.sample_limit
+    state.error_reminder_seconds = runtime.error_reminder_seconds
     current_time = time.monotonic() if now is None else now
+    if config.startup_error:
+        raise StartupError(config.errors[0] if config.errors else "configuration startup error")
+    if config.control_mode == "smc":
+        state.control_mode = "smc"
+        return _run_smc_cycle(fans, state, sysfs_root, current_time)
+    if config.control_mode not in {"t2fand", None}:
+        raise StartupError("invalid control mode")
+    state.control_mode = "t2fand"
     snapshot = discover_sensors(sysfs_root)
-    _update_gpu_state(state, snapshot.gpu_present)
+    _update_gpu_state(state, snapshot.gpu_present, snapshot.dgpu_state)
     rolling_mean: Optional[float] = None
 
     if state.config_failsafe or not config.valid:
@@ -624,15 +892,15 @@ def run_cycle(
         )
         _require_maximum(fans)
         targets = _maximum_targets(fans)
-        if state.recovery_cycles >= SENSOR_RECOVERY_CYCLES:
-            state.history = state.recovery_history[-SAMPLE_LIMIT:]
+        if state.recovery_cycles >= state.sensor_recovery_cycles:
+            state.history = state.recovery_history[-state.sample_limit:]
             state.recovery_history.clear()
             state.recovery_active = False
     else:
         if snapshot.highest is None:
             raise FatalControlError("valid sensor cycle has no highest temperature")
         state.history.append(snapshot.highest)
-        del state.history[:-SAMPLE_LIMIT]
+        del state.history[:-state.sample_limit]
         control_mean = round(mean(state.history), 2)
         configured_full = any(policy and policy.always_full_speed for policy in config.policies)
         rolling_mean = None if configured_full else control_mean
@@ -690,7 +958,17 @@ def run_cycle(
             fan.set_speed(target)
     except (OSError, ValueError, FatalControlError) as exc:
         raise FatalControlError(f"fan target write failed: {exc}") from exc
-    return CycleReport(snapshot, rolling_mean, tuple(targets), tuple(actual))
+    manual, observed_targets, observed_actual, _ = _read_fan_observations(
+        fans, actual_values=tuple(actual)
+    )
+    state.control_status = state.mode or ""
+    return CycleReport(
+        snapshot,
+        rolling_mean,
+        observed_targets,
+        observed_actual,
+        manual,
+    )
 
 
 def emit_verbose(
@@ -702,37 +980,67 @@ def emit_verbose(
     """Emit one compact complete telemetry record."""
 
     sensors = ",".join(
-        f"{reading.label}={reading.value if reading.value is not None else 'unknown'}"
+        f"{reading.label}="
+        f"{reading.value if reading.value is not None else ('skipped' if reading.error == 'dGPU powered off; skipped' else 'unknown')}"
         for reading in report.snapshot.readings
     ) or "none"
-    gpu_value = "present" if report.snapshot.gpu_present else "missing"
+    sensor_status = (
+        "ok"
+        if report.snapshot.valid
+        and all(value is not None for value in report.targets)
+        and all(value is not None for value in report.actual_rpm)
+        else "degraded"
+    )
     fields = [
+        f"control_mode={config.control_mode}",
+        f"control_status={state.control_status or state.mode}",
+        f"sensor_status={sensor_status}",
         f"sensors={sensors}",
-        f"gpu_temps={gpu_value}",
+        f"gpu_temps={'present' if report.snapshot.gpu_present else 'missing'}",
+        f"dgpu_state={report.snapshot.dgpu_state}",
+        f"highest={report.snapshot.highest_label or 'unknown'}",
         f"highest_temp={report.snapshot.highest if report.snapshot.highest is not None else 'unknown'}",
     ]
-    if report.rolling_mean is not None:
+    if config.control_mode == "t2fand" and report.rolling_mean is not None:
         fields.append(f"rolling_mean={report.rolling_mean}")
     fields.extend([f"mode={state.mode}", f"status={state.mode}", f"reason={state.reason}"])
     if state.recovery_active:
         fields.append(
-            f"recovery_cycles={state.recovery_cycles}/{SENSOR_RECOVERY_CYCLES}"
+            f"recovery_cycles={state.recovery_cycles}/{state.sensor_recovery_cycles}"
         )
-    for index, (fan, target, actual) in enumerate(
-        zip(fans, report.targets, report.actual_rpm), start=1
+    for index, (fan, target, actual, manual) in enumerate(
+        zip(fans, report.targets, report.actual_rpm, report.manual or (None,) * len(fans)),
+        start=1,
     ):
         policy = config.policies[index - 1] if index <= len(config.policies) else None
-        if policy is None:
-            policy_fields = "low_temp=unknown high_temp=unknown curve=unknown always_full_speed=unknown"
-        else:
-            policy_fields = (
-                f"low_temp={policy.low_temp} high_temp={policy.high_temp} "
-                f"curve={policy.speed_curve} always_full_speed={str(policy.always_full_speed).lower()}"
-            )
+        policy_fields = ""
+        if config.control_mode == "t2fand":
+            if policy is None:
+                policy_fields = "low_temp=unknown high_temp=unknown curve=unknown always_full_speed=unknown "
+            else:
+                policy_fields = (
+                    f"low_temp={policy.low_temp} high_temp={policy.high_temp} "
+                    f"curve={policy.speed_curve} always_full_speed={str(policy.always_full_speed).lower()} "
+                )
         fields.append(
-            f"fan{index} {policy_fields} target_rpm={target if target is not None else 'unknown'} "
+            f"fan{index} {policy_fields}manual={manual if manual is not None else 'unknown'} "
+            f"target_rpm={target if target is not None else 'unknown'} "
             f"actual_rpm={actual if actual is not None else 'unknown'}"
         )
+    emit("telemetry " + " ".join(fields))
+
+
+def emit_compact(report: CycleReport, fans: Sequence[Fan]) -> None:
+    """Emit the hottest sensor and actual fan speeds for one cycle."""
+
+    fields = [
+        f"highest={report.snapshot.highest_label or 'unknown'}",
+        f"highest_temp={report.snapshot.highest if report.snapshot.highest is not None else 'unknown'}",
+    ]
+    fields.extend(
+        f"{fan.name} actual_rpm={actual if actual is not None else 'unknown'}"
+        for fan, actual in zip(fans, report.actual_rpm)
+    )
     emit("telemetry " + " ".join(fields))
 
 
@@ -755,13 +1063,18 @@ def run_loop(
     verbose: bool = False,
     sleeper: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    settings: Optional[RuntimeSettings] = None,
 ) -> None:
     """Run one-second cycles until a signal handler requests shutdown."""
 
     while not state.shutdown_requested:
-        report = run_cycle(fans, config, state, sysfs_root, clock())
+        report = run_cycle(
+            fans, config, state, sysfs_root, clock(), settings=settings
+        )
         if verbose:
             emit_verbose(report, fans, config, state)
+        else:
+            emit_compact(report, fans)
         if not state.shutdown_requested:
             sleeper(1)
     _set_mode(state, "shutting-down", "shutdown requested", clock())
@@ -829,10 +1142,75 @@ def cleanup_fans(fans: Sequence[Fan]) -> list[str]:
     return errors
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive finite float") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite float")
+    return parsed
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="T2 fan thermal controller")
+    parser = argparse.ArgumentParser(
+        description="T2 fan thermal controller",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
-        "-v", "--verbose", action="store_true", help="emit one telemetry record per second"
+        "-v", "--verbose", action="store_true", help="emit full telemetry"
+    )
+    parser.add_argument(
+        "-c",
+        "--config-path",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help="configuration file path",
+    )
+    parser.add_argument(
+        "-p",
+        "--pid-path",
+        type=Path,
+        default=DEFAULT_PID_PATH,
+        help="PID file path",
+    )
+    parser.add_argument(
+        "-s",
+        "--sysfs-path",
+        type=Path,
+        default=DEFAULT_SYSFS_ROOT,
+        help="sysfs root path",
+    )
+    parser.add_argument(
+        "-r",
+        "--sensor-recovery-cycles",
+        type=_positive_int,
+        default=SENSOR_RECOVERY_CYCLES,
+        help="valid cycles before sensor recovery",
+    )
+    parser.add_argument(
+        "-l",
+        "--sample-limit",
+        type=_positive_int,
+        default=SAMPLE_LIMIT,
+        help="maximum temperature samples",
+    )
+    parser.add_argument(
+        "-e",
+        "--error-reminder-seconds",
+        type=_positive_float,
+        default=ERROR_REMINDER_SECONDS,
+        help="minimum seconds between repeated error reminders",
     )
     return parser
 
@@ -841,39 +1219,68 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """Validate startup state, run the foreground controller, and clean up."""
 
     args = _parser().parse_args(argv)
+    runtime_settings = RuntimeSettings(
+        args.sensor_recovery_cycles,
+        args.sample_limit,
+        args.error_reminder_seconds,
+    )
     if os.geteuid() != 0:
         emit("T2 Fan Daemon must be run as root", error=True)
         return 1
 
     fans: list[Fan] = []
-    state = ControllerState()
+    state = ControllerState(
+        sensor_recovery_cycles=runtime_settings.sensor_recovery_cycles,
+        sample_limit=runtime_settings.sample_limit,
+        error_reminder_seconds=runtime_settings.error_reminder_seconds,
+    )
     pid_owned = False
     manual_attempted = False
+    ownership_attempted = False
+    maximum_cleanup_required = False
     control_started = False
     fatal: Optional[str] = None
     try:
-        prepare_pid(DEFAULT_PID_PATH)
-        fans, fan_errors = discover_fans()
+        prepare_pid(args.pid_path)
+        fans, fan_errors = discover_fans(args.sysfs_path)
         if fan_errors:
+            maximum_cleanup_required = True
             raise FatalControlError("; ".join(fan_errors))
-        config = load_configuration(DEFAULT_CONFIG_PATH, len(fans))
+        config = load_configuration(args.config_path, len(fans))
         emit(f"T2 Fan Daemon starting: fans={len(fans)}")
+        if config.startup_error or config.control_mode not in {"smc", "t2fand"}:
+            raise StartupError(config.errors[0] if config.errors else "invalid control mode")
+        for warning in config.warnings:
+            emit(f"configuration warning: {warning}", error=True)
         for problem in config.errors:
             emit(f"configuration error: {problem}", error=True)
+        state.control_mode = config.control_mode
         install_signal_handlers(state)
-        write_pid(DEFAULT_PID_PATH)
+        write_pid(args.pid_path)
         pid_owned = True
-        manual_attempted = True
-        for fan in fans:
-            try:
-                fan.enable_manual()
-            except (OSError, ValueError) as exc:
-                raise FatalControlError(f"{fan.name}: cannot enable manual mode: {exc}") from exc
+        if config.control_mode == "smc":
+            ownership_attempted = True
+            release_smc_ownership(fans, state)
+        else:
+            manual_attempted = True
+            for fan in fans:
+                try:
+                    fan.enable_manual()
+                except (OSError, ValueError) as exc:
+                    raise FatalControlError(f"{fan.name}: cannot enable manual mode: {exc}") from exc
+            if not config.valid:
+                maximum_cleanup_required = True
+                _set_mode(state, "config-failsafe", config.errors[0], time.monotonic())
+                _require_maximum(fans)
         control_started = True
-        if not config.valid:
-            _set_mode(state, "config-failsafe", config.errors[0], time.monotonic())
-            _require_maximum(fans)
-        run_loop(fans, config, state, verbose=args.verbose)
+        run_loop(
+            fans,
+            config,
+            state,
+            sysfs_root=args.sysfs_path,
+            verbose=args.verbose,
+            settings=runtime_settings,
+        )
     except (StartupError, FatalControlError) as exc:
         fatal = str(exc)
     except Exception as exc:
@@ -884,13 +1291,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if fatal is not None:
             _set_mode(state, "control-error", fatal, time.monotonic())
             emit(f"critical: {fatal}", error=True)
-            for problem in attempt_maximum(fans):
+            if (
+                (maximum_cleanup_required or manual_attempted or ownership_attempted)
+                and not state.maximum_escalated
+            ):
+                for problem in attempt_maximum(fans):
+                    emit(f"cleanup error: {problem}", error=True)
+        if manual_attempted or ownership_attempted:
+            cleanup_errors = cleanup_fans(fans)
+            for problem in cleanup_errors:
                 emit(f"cleanup error: {problem}", error=True)
-        if manual_attempted:
-            for problem in cleanup_fans(fans):
-                emit(f"cleanup error: {problem}", error=True)
+            if (
+                fatal is None
+                and config.control_mode == "smc"
+                and cleanup_errors
+            ):
+                fatal = "SMC ownership release failed during shutdown: " + "; ".join(
+                    cleanup_errors
+                )
+                _set_mode(state, "control-error", fatal, time.monotonic())
+                emit(f"critical: {fatal}", error=True)
+                for problem in attempt_maximum(fans):
+                    emit(f"cleanup error: {problem}", error=True)
         if pid_owned:
-            problem = remove_pid(DEFAULT_PID_PATH)
+            problem = remove_pid(args.pid_path)
             if problem is not None:
                 emit(f"cleanup error: {problem}", error=True)
         if fatal is None and control_started:

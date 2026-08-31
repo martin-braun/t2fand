@@ -6,8 +6,8 @@
 opencode.json
 # CONTEXT.md
 
-# Created by https://www.toptal.com/developers/gitignore/api/python,archlinuxpackages
-# Edit at https://www.toptal.com/developers/gitignore?templates=python,archlinuxpackages
+# Created by https://www.toptal.com/developers/gitignore/api/python,archlinuxpackages,vim,visualstudiocode
+# Edit at https://www.toptal.com/developers/gitignore?templates=python,archlinuxpackages,vim,visualstudiocode
 
 ### ArchLinuxPackages ###
 *.tar
@@ -195,4 +195,44 @@ poetry.toml
 # LSP config files
 pyrightconfig.json
 
-# End of https://www.toptal.com/developers/gitignore/api/python,archlinuxpackages
+### Vim ###
+# Swap
+[._]*.s[a-v][a-z]
+!*.svg  # comment out if you don't need vector files
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+
+# Session
+Session.vim
+Sessionx.vim
+
+# Temporary
+.netrwhist
+*~
+# Auto-generated tag files
+tags
+# Persistent undo
+[._]*.un~
+
+### VisualStudioCode ###
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+
+# Local History for Visual Studio Code
+.history/
+
+# Built Visual Studio Code Extensions
+*.vsix
+
+### VisualStudioCode Patch ###
+# Ignore all local history of files
+.history
+.ionide
+
+# End of https://www.toptal.com/developers/gitignore/api/python,archlinuxpackages,vim,visualstudiocode
