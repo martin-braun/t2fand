@@ -63,16 +63,19 @@ prevention, acoustic improvement, and every-model compatibility are `unknown`.
 
 - `t2fand` is an executable Python script with no compilation step. It is
   import-safe and runs in the foreground through `main()`.
-- Fan discovery unions T2 and class-hwmon candidates, deduplicates resolved base
-  paths, and requires every discovered candidate to be complete and
-  controllable; one complete fan does not mask an incomplete candidate.
+- Fan discovery uses only T2 candidates below `devices/*/*/*/*/APP0001:00/fan*`;
+  it expands `fan*_input`, deduplicates resolved base paths, and requires every
+  discovered candidate to be complete and controllable. Class-hwmon temperature
+  paths remain sensor inputs, not fan candidates.
 - It re-discovers and reopens fan and temperature paths each cycle, reads each
   deduplicated temperature input once, labels optional metadata, and selects the
-  hottest valid value. CPU availability requires one selected, fault-free,
-  parsed, positive CPU channel; a non-positive sibling does not cancel it. Any
-  selected input read/parse/fault failure, including CPU, enters recoverable
-  sensor-failsafe while fan control survives. GPU inputs below exact numeric DRM
-  cards are optional and report missing/recovery transitions.
+  hottest valid value. When readable, a vgaswitcheroo `DIS:Off` dGPU PCI address
+  excludes only matching resolved temperature paths. CPU availability requires
+  one selected, fault-free, parsed, positive CPU channel; a non-positive sibling
+  does not cancel it. Any selected input read/parse/fault failure, including
+  CPU, enters recoverable sensor-failsafe while fan control survives. GPU inputs
+  below exact numeric DRM cards are optional and report missing/recovery
+  transitions.
 - Normal control samples once per second, keeps at most five valid maxima, and
   uses their mean rounded to two decimals. Sensor and config fail-safe modes
   bypass smoothing and attempt every known maximum. Valid `configured-full`
@@ -95,19 +98,26 @@ prevention, acoustic improvement, and every-model compatibility are `unknown`.
 - `t2fand.initd` is the sole root OpenRC definition for the foreground daemon.
 - `Makefile` unconditionally installs the OpenRC definition, stages with
   `DESTDIR`, and applies the declared executable/service modes.
-- `PKGBUILD` directly ships only the executable and OpenRC definition, with
-  `pkgname=t2fand`, release `2.0.0-1` (`pkgver=2.0.0`, `pkgrel=1`), and
-  `util-linux` for `/usr/bin/logger`.
+- `PKGBUILD` names local `t2fand`, `t2fand.initd`, and `Makefile` sources and
+  delegates package staging to `make DESTDIR="$pkgdir" install`. It ships only
+  the executable and OpenRC definition, with `pkgname=t2fand`, release `2.0.1-1`
+  (`pkgver=2.0.1`, `pkgrel=1`), and `util-linux` for `/usr/bin/logger`.
+- `.gitignore` ignores local `opencode.json` and generated build/release paths;
+  `opencode.json` is not a product or package input. No removal of ignored local
+  state is claimed.
 - `tests/test_t2fand.py` is a standard-library unittest suite using temporary
   fake sysfs/config trees and mocks. Definitions include absent-CPU,
-  config-generation-I/O, and partial-discovered-fan fixtures. `make test` is the
-  project-native target and remains unexecuted.
+  config-generation-I/O, and partial-discovered-fan fixtures. Its default
+  fixture still provides only a class-hwmon fan, and its package assertion still
+  expects 2.0.0 and direct install commands; these definitions are stale static
+  evidence. `make test` is the project-native target and remains unexecuted.
 - No systemd unit or systemd payload is present.
 - `.github/workflows/build.yml` provides package build, artifact, and release
   automation.
 - README/CONTEXT synchronization follows REQ-051: README is concise operator
-  onboarding; exhaustive contract and implementation truth remain here and in
-  `SPEC.md`.
+  onboarding. It identifies Artix Linux/OpenRC package use, local checkout
+  install/staging, configuration, safety, logging, and project-native testing;
+  exhaustive contract and implementation truth remain here and in `SPEC.md`.
 
 These are source/configuration facts. Test execution, runtime, hardware,
 privileged install, staged output, package-build, release, syslog delivery, and
@@ -119,8 +129,8 @@ CI success are not verified.
   sync does not claim test execution or passing results.
 - OpenRC operation is unverified. Its checked-in definition and directive values
   are static evidence, not a runtime claim.
-- The package fetches an unpinned remote Git source with `sha256sums=('SKIP')`;
-  equivalence with this local checkout is `unknown`.
+- `PKGBUILD` uses checked-in local source names with `sha256sums=('SKIP')`;
+  package provenance and build output remain `unknown`.
 - Configuration reload, schema migration, rollback, and fan-topology migration
   are not defined.
 - Outcomes after pre-control unexpected exceptions remain `unknown`; those
@@ -139,10 +149,13 @@ CI success are not verified.
 2. `Fan` wraps one sysfs fan base path. Discovery reads integer `_max` and
    `_min`; control clamps and reopens `_output`; manual mode reopens `_manual`.
    Tachometer reads reopen `_input` and are diagnostic.
-3. Sensor discovery unions global hwmon, coretemp, and `device/hwmon` below
-   exact numeric DRM cards. Resolved aliases are deduplicated; each selected
-   input is read once per cycle. Optional names, labels, and fault flags enrich
-   labels/classification without optional labels gating operation.
+3. Fan discovery scans only the T2 `APP0001:00` layout and deduplicates resolved
+   fan bases. Sensor discovery separately unions global hwmon, coretemp, and
+   `device/hwmon` below exact numeric DRM cards. A readable vgaswitcheroo
+   `DIS:Off` PCI address filters matching resolved temperature candidates only.
+   Resolved aliases are deduplicated; each selected input is read once per
+   cycle. Optional names, labels, and fault flags enrich labels/classification
+   without optional labels gating operation.
 4. `configparser` reads `/etc/t2fand.conf` once at startup. One validated
    four-value policy is stored for each discovered fan. Invalid policy is a
    global config fail-safe when maximum control remains available.
@@ -153,7 +166,7 @@ CI success are not verified.
 
 ### Discovery and control/data flow
 
-Startup checks effective UID, handles `/run/t2fand.pid`, discovers every
+Startup checks effective UID, handles `/run/t2fand.pid`, discovers every T2-only
 deduplicated fan candidate and requires all candidates to be complete and
 controllable, generates or validates `/etc/t2fand.conf`, installs signal-request
 handlers, writes the PID, enables manual mode, and enters the outer lifecycle
@@ -167,13 +180,15 @@ converted, and `BaseException` is outside this handling.
 
 Each one-second cycle re-discovers temperature inputs, reads each resolved path
 once, parses signed integer millidegrees Celsius, treats faulted/failed values
-as `unknown`, and selects the highest valid value. CPU is required and must be
-positive. Any selected read, parse, or fault failure, including CPU, enters
-recoverable sensor-failsafe while maximum fan control survives; absent CPU also
-enters that mode. Absent GPU topology is not itself a failure. Normal history
-contains at most five valid maxima. Fail-safe bypasses history, commands known
-maxima, and retries. Five consecutive fully valid recovery cycles replace old
-history; curve smoothing resumes on the following normal cycle.
+as `unknown`, and selects the highest valid value. A readable vgaswitcheroo
+`DIS:Off` dGPU PCI address excludes matching resolved paths before reading;
+unavailable switch state leaves general discovery enabled. CPU is required and
+must be positive. Any selected read, parse, or fault failure, including CPU,
+enters recoverable sensor-failsafe while maximum fan control survives; absent
+CPU also enters that mode. Absent GPU topology is not itself a failure. Normal
+history contains at most five valid maxima. Fail-safe bypasses history, commands
+known maxima, and retries. Five consecutive fully valid recovery cycles replace
+old history; curve smoothing resumes on the following normal cycle.
 
 Each fan policy converts the rolling mean to a clamped integer output using the
 legacy linear, cubic exponential, or logarithmic expression. A valid configured
@@ -209,7 +224,7 @@ RPM-telemetry-failure records omit the rolling mean.
 | PID file          | `/run/t2fand.pid` stores the daemon's decimal PID. A live `/proc/<pid>` path rejects startup; malformed or stale state is diagnosed and removed when possible. Identity locking and atomicity are not implemented.                                                                                  |
 | Config file       | `/etc/t2fand.conf`, generated only when absent, validated globally, and read once at startup. Invalid administrator content is not normalized.                                                                                                                                                      |
 | Fan sysfs         | Read integer `<base>_max`, `<base>_min`, and tachometer `<base>_input`; write `<base>_output` and `<base>_manual`, reopening each path.                                                                                                                                                             |
-| Temperature sysfs | Union global hwmon, coretemp, and exact numeric DRM-card descendants; parse signed integer millidegree-Celsius text. Failed values are `unknown`; aliases deduplicate by resolved path.                                                                                                             |
+| Temperature sysfs | Union global hwmon, coretemp, and exact numeric DRM-card descendants; parse signed integer millidegree-Celsius text. A matching vgaswitcheroo `DIS:Off` dGPU path is skipped. Failed values are `unknown`; aliases deduplicate by resolved path.                                                    |
 | Signals           | SIGTERM and SIGINT only request common cleanup. After manual control starts, an unexpected ordinary `Exception` becomes fatal `control-error` handling; pre-control unexpected exceptions and `BaseException` are outside this conversion. Other abrupt termination paths cannot guarantee cleanup. |
 
 ### Configuration schema
@@ -330,12 +345,14 @@ Staged output, host writes, and service state are unknown.
 
 ### Package and release
 
-`PKGBUILD` declares package `t2fand` release `2.0.0-1` (`pkgver=2.0.0`,
+`PKGBUILD` declares package `t2fand` release `2.0.1-1` (`pkgver=2.0.1`,
 `pkgrel=1`), target `x86_64`, GPL3, dependencies `linux-t2`, `python`, and
-`util-linux`, and build dependency `git`. Its `build()` function does nothing.
-Its `package()` function directly installs only `/usr/bin/t2fand` mode 0700 and
-`/etc/init.d/t2fand` mode 0755. It creates no systemd directory or payload.
-Package build output and the exact remote source result are unknown.
+`util-linux`, and build dependency `git`. Its local source list is `t2fand`,
+`t2fand.initd`, and `Makefile`; no `build()` function is defined and `package()`
+runs `make DESTDIR="$pkgdir" install`. The Makefile stages only
+`/usr/bin/t2fand` mode 0700 and `/etc/init.d/t2fand` mode 0755. It creates no
+systemd directory or payload. Package build output and checksum/provenance
+results are unknown.
 
 ### Administrator service workflow
 
@@ -418,8 +435,12 @@ manager-switching guidance is superseded; external procedures are `unknown`.
   `supervise_daemon_args="--respawn-delay-step 2"`, and `retry="SIGTERM/5"`.
   `need localmount` and soft `use logger` are present; no network, background,
   daemonization, or supervisor `pidfile` setting is present.
-- The PKGBUILD source has no revision pin and uses `sha256sums=('SKIP')`.
-  Reproducibility, provenance, and local/package equivalence remain `unknown`.
+- `PKGBUILD` names checked-in local sources and uses `sha256sums=('SKIP')`.
+  Reproducibility, package provenance, and build output remain `unknown`.
+- `opencode.json` is ignored local state, not a product, daemon, package, or
+  release input. Generated package/source staging, Python build/distribution,
+  archive, log, signature, and zip paths are ignored and are not product payload
+  or contract evidence.
 - `make test` is the documented project-native test target. Test execution and
   packaging CI are not product-runtime validation and are not claimed here.
 
@@ -442,9 +463,10 @@ possible. Manual-mode disable is attempted on the common cleanup route; prior
 state is not recorded, and abrupt-failure outcomes are `unknown`.
 
 Package/release trust crosses the Git checkout action, the Arch container image,
-the keyserver-imported GPG key, GitHub Actions, and the unpinned Git source in
-`PKGBUILD`. These are declared dependencies, not locally verified guarantees.
-The workflow passes `GITHUB_TOKEN` to its release action; no secret value is
+the keyserver-imported GPG key, GitHub Actions, and local package sources with
+skipped checksums. These are declared dependencies or metadata, not locally
+verified guarantees. The current `PKGBUILD` declares no remote source. The
+workflow passes `GITHUB_TOKEN` to its release action; no secret value is
 recorded here.
 
 Do not add secrets, treat remote metadata as proof, or treat README examples as
@@ -455,11 +477,12 @@ runtime-safety evidence.
 ### Evidence available
 
 The current evidence is static inspection of `t2fand`, `README.md`, `Makefile`,
-`PKGBUILD`, `t2fand.initd`, `tests/test_t2fand.py`, and
+`PKGBUILD`, `t2fand.initd`, `tests/test_t2fand.py`, `.gitignore`, and
 `.github/workflows/build.yml`, summarized in `SPEC.md`. It verifies source
-expressions, fake-fixture test definitions, artifact paths/modes, unconditional
-OpenRC install rules, logger/package declarations, and integration settings; it
-does not verify execution.
+expressions, T2-only fan discovery, vgaswitcheroo filtering, fake-fixture test
+definitions, local package staging, release metadata, ignored artifact paths,
+unconditional OpenRC install rules, logger/package declarations, and integration
+settings; it does not verify execution.
 
 The project-native test command is `make test`; it is present and was not
 executed in this documentation sync. No passing test result, hardware fixture
@@ -475,12 +498,14 @@ Current static validation target:
 2. Confirm `t2fand.service` and all systemd install/package paths are absent.
 3. Confirm unconditional `DESTDIR`/`BINDIR`/`OPENRC_INITDDIR` installation,
    exact source payload, and modes 0700/0755 in `Makefile`.
-4. Confirm `PKGBUILD` uses `pkgname=t2fand`, `pkgver=2.0.0`, `pkgrel=1`, exactly
-   the daemon and OpenRC init payload, `util-linux`, and no selected syslog
-   daemon.
+4. Confirm `PKGBUILD` uses `pkgname=t2fand`, local `t2fand`, `t2fand.initd`, and
+   `Makefile` sources, `pkgver=2.0.1`, `pkgrel=1`, and `make DESTDIR` staging;
+   confirm the exact daemon and OpenRC init payload, `util-linux`, and no
+   selected syslog daemon.
 5. Confirm daemon ownership of `/run/t2fand.pid` and separate OpenRC supervisor
    state.
-6. Confirm global hwmon/CPU/DRM discovery, numeric DRM filtering, deduplication,
+6. Confirm T2-only fan discovery, global hwmon/CPU/DRM sensor discovery,
+   vgaswitcheroo `DIS:Off` filtering, numeric DRM filtering, deduplication,
    one-read cycles, hottest selection, recoverable sensor fail-safe for selected
    failures including CPU, five-cycle recovery, configured-full mean bypass, RPM
    fail-high without rolling mean or new sensor recovery, rate-limited default
@@ -490,10 +515,21 @@ Current static validation target:
    partial fan authority/control loss is fatal.
 7. Confirm five respawns per 60 seconds, two-second base/incremental delay,
    explicit-stop suppression, and logger directives from source evidence.
+8. Confirm `.gitignore` covers `opencode.json` and generated build/release
+   artifacts; neither ignored local state nor generated artifacts is product
+   evidence.
 
 Staged installation, package build, runtime, hardware, OpenRC lifecycle, and
 syslog results remain unknown. No README snippet or lifecycle command was
 executed.
+
+The unexecuted static test
+`test_package_has_exact_openrc_payload_and_no_alternate_selector` still asserts
+the superseded `2.0.0` release and direct `PKGBUILD` install commands; it is
+stale against the local-source `PKGBUILD`. The default fake fixture still
+provides only a class-hwmon fan, while current fan discovery is T2-only; tests
+that rely on that default fan are stale against the implementation. No test pass
+or runtime claim is made from these definitions.
 
 ### Retired and pending validation
 
@@ -566,8 +602,9 @@ file must not be represented as a successful dprint Markdown check.
 - Keep OpenRC as the only manager and the two-file payload boundary.
   `util-linux` is explicitly required for `/usr/bin/logger`; no syslog daemon is
   selected.
-- Treat package provenance and local/package equivalence as `unknown` because
-  the source is unpinned and checksum verification is skipped.
+- Treat package provenance, checksum assurance, and build output as `unknown`
+  because local package sources use skipped checksums and no package build was
+  run.
 - Record `make test` as the project-native command without claiming execution or
   passing results.
 - Keep implementation fixes, packaging changes, CI changes, and SPEC changes
@@ -626,8 +663,8 @@ file must not be represented as a successful dprint Markdown check.
   config-generation-I/O, and partial-fan fake fixtures are present; `make test`
   remains unexecuted.
 
-- `H-010` (current release reconciliation): checked-in `PKGBUILD` now declares
-  intentional release `2.0.0-1` (`pkgver=2.0.0`, `pkgrel=1`). The prior
+- `H-010` (superseded release reconciliation): checked-in `PKGBUILD` then
+  declared intentional release `2.0.0-1` (`pkgver=2.0.0`, `pkgrel=1`). The prior
   `1.2.0-3` package fact remains superseded history; payload, dependency, and
   metadata outcomes remain unverified.
 - `H-011` (current documentation ownership transition): REQ-051 makes README
@@ -641,6 +678,35 @@ file must not be represented as a successful dprint Markdown check.
   attempts known maxima and fan/PID cleanup, exits nonzero, and omits the normal
   stopped summary. Pre-control unexpected exceptions and `BaseException` remain
   outside this conversion; runtime outcomes remain unverified.
+
+### 2.0.1 handoff transition
+
+- Fan selection moved from the retained 2.0.0 union of T2 and class-hwmon fan
+  candidates to T2-only `APP0001:00` candidates. Reason: keep fan-control
+  authority within the T2 fan layout while retaining global hwmon as a
+  temperature-sensor source. `_fan_candidates()` and `discover_fans()` verify
+  the path, expansion, deduplication, and all-candidate checks.
+- Readable vgaswitcheroo `DIS:Off` dGPU entries now filter only matching
+  resolved temperature paths. Reason: exclude an explicitly powered-off dGPU
+  without disabling other hwmon/DRM discovery. `_off_dgpu_pci()` and
+  `discover_sensors()` verify this boundary; absent/unreadable switch state
+  remains non-fatal.
+- Arch packaging now names checked-in `t2fand`, `t2fand.initd`, and `Makefile`
+  sources, then delegates staging through `make DESTDIR="$pkgdir" install`.
+  Reason: keep package staging on the local exact two-file OpenRC payload.
+  `PKGBUILD` and `Makefile` verify the static path, mode, and delegation
+  definitions; package/staging results remain unknown.
+- README now documents the Artix Linux/OpenRC package workflow and local
+  checkout staging as concise operator onboarding. This verifies documentation
+  placement and scope only; no install or service result is claimed.
+- `opencode.json` is ignored local state, not a product input. `.gitignore` also
+  ignores generated package/source staging, Python build/distribution, archive,
+  log, signature, and zip paths. No ignored-state removal or artifact generation
+  is claimed.
+- The package release moved from the historical 2.0.0 state to `2.0.1-1`
+  (`pkgver=2.0.1`, `pkgrel=1`), with name, metadata, dependencies, and exact
+  two-file payload retained. `PKGBUILD` verifies the declaration; build and
+  release outcomes remain unknown.
 
 ### Superseded daemon behavior
 
@@ -690,8 +756,8 @@ installation and staging paths, four-key configuration, OpenRC operation, logger
 routing, safety limits, and the project-native test target. It is operator
 guidance, not runtime evidence. No monitoring, upgrade cadence, hardware test
 routine, or ownership handoff is defined. Re-check package source pinning,
-checksum policy, OpenRC runtime behavior, logger receiver configuration, and CI
-execution before relying on a release artifact.
+checksum policy, local staging, OpenRC runtime behavior, logger receiver
+configuration, and CI execution before relying on a release artifact.
 
 ## 11. Agent rules
 
@@ -710,10 +776,12 @@ Current source shape: a root-required foreground Python daemon discovers global
 hwmon, CPU, and exact numeric DRM-card temperatures, requires one usable
 positive CPU channel for normal control, and enters recoverable sensor-failsafe
 on any selected sensor read/parse/fault failure, including CPU, when fan control
-survives. It selects the hottest valid input and applies global fail-safe
-decisions to all controllable fans. Every discovered, resolved-path-deduplicated
-fan candidate must be complete and controllable; partial authority/control loss
-is fatal. Normal control samples once per second over at most five valid maxima;
+survives. Readable vgaswitcheroo `DIS:Off` dGPU entries filter matching resolved
+temperature paths only. Fan discovery is T2-only below `APP0001:00`; every
+discovered, resolved-path-deduplicated candidate must be complete and
+controllable, and partial authority/control loss is fatal. It selects the
+hottest valid input and applies global fail-safe decisions to all controllable
+fans. Normal control samples once per second over at most five valid maxima;
 sensor recovery requires five valid cycles. Configured-full and RPM telemetry
 failure omit the rolling mean; RPM failure commands maximum without starting
 sensor recovery. It reports explicit modes, verbose target/actual RPM telemetry,
@@ -724,7 +792,8 @@ nonzero exit, and no normal stopped summary; pre-control unexpected exceptions
 and `BaseException` remain outside this conversion. OpenRC is the sole service
 integration; `t2fand.initd` supervises the foreground daemon, which owns
 `/run/t2fand.pid`. The Makefile and PKGBUILD provide the exact daemon/init
-payload with source modes 0700/0755; `pkgname=t2fand` and release `2.0.0-1`;
+payload with installed modes 0700/0755; `PKGBUILD` uses local sources and
+release `2.0.1-1`. `opencode.json` and generated artifacts are ignored, and
 util-linux supports service logger routing. No systemd payload exists.
 
 Static source/test inspection is complete for the revised local surfaces;
@@ -732,5 +801,5 @@ absent-CPU, config-generation-I/O, and partial-fan fake fixtures are present,
 and `make test` is present but was not executed in this sync. Not verified:
 hardware behavior, compatibility coverage, test pass/fail, build/release
 success, staged installation, package build, OpenRC lifecycle, directive
-support, syslog delivery/persistence, and equivalence between the unpinned
-`PKGBUILD` source and this checkout.
+support, syslog delivery/persistence, package provenance, and checksum
+assurance.
