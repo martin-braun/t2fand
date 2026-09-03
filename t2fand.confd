@@ -1,0 +1,5 @@
+# t2fand owns daemon defaults and options.
+# t2fand_args provides optional overrides.
+# t2fand --help is authoritative.
+# Example: t2fand_args="--verbose --sensor-recovery-cycles 10"
+t2fand_args=""
